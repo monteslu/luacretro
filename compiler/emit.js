@@ -266,27 +266,52 @@ export function emit(chunk, symbols, file, opts = {}) {
   // gametank color tooling (SDK-provided; only the gametank target bakes colors)
   const P8_PALETTE = opts.p8Palette || null;
   const nearestColorByte = opts.nearestColorByte || null;
-  // This SDK targets the GBA only (arm-gcc / libtonc / maxmod). `target` defaults
-  // to "gba"; the front-end (lex/parse/check) + arg lowering is target-independent,
-  // and every draw builtin is a plain gba_*(args) call (no zero-page fastcall ABI).
-  const target = opts.target === "gametank" ? "gametank"
+  // ---- target + capability model (ONE source of truth) ----------------------
+  // Every per-platform behavior derives from CAPS[target] here, instead of gate
+  // spaghetti scattered through the emitter. Adding a target = one CAPS row.
+  //
+  // Capability keys:
+  //   zpFastcall  6502 zero-page fastcall ABI for DRAW builtins + camera/btn
+  //               inline + the fixed-runtime fa/fb staging (gt_a*/gt_p*). Only
+  //               the 6502 targets (gametank/nes/c64) have a zero page.
+  //   banked      GameTank FLASH2M cross-bank far-call machinery (gametank only
+  //               in v1; NES/C64 banking is a later milestone).
+  //   nativeDiv   the CPU has a hardware integer divide/modulo (gba/md); false
+  //               targets go through the gt_ifdiv/gt_ffmod runtime helpers.
+  //   colorBake   a static P8 color literal 0-15 is baked to a raw platform
+  //               palette byte at compile time (needs opts.p8Palette). The
+  //               framebuffer targets (gba/md) pass the raw index instead.
+  //   framebuffer the platform has a full pixel surface (gba/md/c64), so every
+  //               P8 drawing verb lands somewhere. false = a tile/sprite machine
+  //               (nes) whose SDK enables only the verbs it can honor.
+  //   prefix      the final cName remap: "" keeps gt_ names, else gt_p8_*/gt_*
+  //               collapse to <prefix>_ (matches the runtime's symbol schema).
+  const CAPS = {
+    gametank: { zpFastcall: true,  banked: true,  nativeDiv: false, colorBake: true,  framebuffer: true,  prefix: "" },
+    gba:      { zpFastcall: false, banked: false, nativeDiv: true,  colorBake: false, framebuffer: true,  prefix: "gba" },
+    md:       { zpFastcall: false, banked: false, nativeDiv: true,  colorBake: false, framebuffer: true,  prefix: "md" },
+    nes:      { zpFastcall: true,  banked: false, nativeDiv: false, colorBake: true,  framebuffer: false, prefix: "nes" },
+    c64:      { zpFastcall: true,  banked: false, nativeDiv: false, colorBake: true,  framebuffer: true,  prefix: "c64" },
+  };
+  const target = CAPS[opts.target] ? opts.target
+               : opts.target === "gametank" ? "gametank"
                : opts.target === "md" ? "md" : "gba";
+  const caps = CAPS[target];
   const isGba = target === "gba";
   const isGametank = target === "gametank";
   const isMd = target === "md";
-  // GBA reuses the builtins table verbatim; only the C SYMBOL a verb resolves to
-  // differs. The GameTank runtime names everything gt_p8_* / gt_*; the GBA
-  // runtime (gba_api.c) mirrors the same set as gba_*. Remap at the call site so
-  // the table stays single-source (no forked builtins.js).
+  const isNes = target === "nes";
+  const isC64 = target === "c64";
+  // A target's C runtime names everything gt_p8_*/gt_* in the SHARED schema; the
+  // per-platform runtime mirrors the same set under its own prefix. Remap at the
+  // call site so the builtins table stays single-source (no forked builtins.js).
+  // GameTank keeps the gt_* schema names verbatim (prefix "").
   const cName = (c) => {
-    if (!c) return c;
-    // GameTank keeps the gt_p8_*/gt_* schema names verbatim (identity).
-    if (isGba) return c.replace(/^gt_p8_/, "gba_").replace(/^gt_/, "gba_");
-    if (isMd) return c.replace(/^gt_p8_/, "md_").replace(/^gt_/, "md_");
-    return c;
+    if (!c || !caps.prefix) return c;
+    return c.replace(/^gt_p8_/, caps.prefix + "_").replace(/^gt_/, caps.prefix + "_");
   };
-  // Only the GameTank has a banked (FLASH2M) build; GBA/Genesis are flat.
-  const banked = opts.banked === true && isGametank;
+  // Only the GameTank has a banked (FLASH2M) build in v1.
+  const banked = opts.banked === true && caps.banked;
   const placement = opts.placement ?? {};
   const bankOf = (name) => (banked ? (placement[name] ?? "fixed") : "fixed");
   const out = [];
@@ -644,8 +669,8 @@ export function emit(chunk, symbols, file, opts = {}) {
           return cv(N8 ? `(${expr(e.left, "fixed")} >> ${8 + lg})`
                        : `(int)(${expr(e.left, "fixed")} >> ${16 + lg})`, "int", want);
         }
-        // GBA/Genesis: native integer division (hardware). GameTank: runtime helper.
-        if (ok === "int") return cv(!isGametank
+        // hardware divide (gba/md): native C. 6502 targets: runtime helper.
+        if (ok === "int") return cv(caps.nativeDiv
           ? `((${expr(e.left, "int")}) / (${expr(e.right, "int")}))`
           : `gt_ifdiv(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
         return cv(N8 ? `(${fixedCall("gt_fdiv", e.left, e.right)} >> 8)`
@@ -656,8 +681,8 @@ export function emit(chunk, symbols, file, opts = {}) {
           if (k === "int") return cv(`(${expr(e.left, "int")} & ${e.divConst - 1})`, "int", want);
           return cv(`(${expr(e.left, "fixed")} & ${(e.divConst * FONE) - 1}${FL})`, "fixed", want);
         }
-        // GBA/Genesis: native modulo (hardware divide). GameTank: runtime helpers.
-        if (!isGametank) {
+        // hardware divide (gba/md): native modulo. 6502 targets: runtime helpers.
+        if (caps.nativeDiv) {
           if (k === "int") return cv(`((${expr(e.left, "int")}) % (${expr(e.right, "int")}))`, "int", want);
           // 16.16 fixed modulo == a % b on the raw fixed ints (fraction preserved).
           return cv(`((${expr(e.left, "fixed")}) % (${expr(e.right, "fixed")}))`, "fixed", want);
@@ -692,11 +717,12 @@ export function emit(chunk, symbols, file, opts = {}) {
   function fixedCall(fn, left, right) {
     const L = expr(left, "fixed");
     const R = expr(right, "fixed");
-    // GBA/Genesis: 16.16 fixed mul/div are NATIVE C via a 64-bit intermediate —
-    // the ARM7 and 68000 have hardware multiply + divide, so no runtime call and
-    // no zero-page staging (the whole gt_fmul/gt_fdiv/fa/fb apparatus is a 6502
-    // workaround better hardware doesn't need).
-    if (!isGametank) {
+    // Hardware-divide targets (gba/md): 16.16 fixed mul/div are NATIVE C via a
+    // 64-bit intermediate — the ARM7 and 68000 have hardware multiply + divide,
+    // so no runtime call and no zero-page staging (the whole gt_fmul/gt_fdiv/
+    // fa/fb apparatus is a 6502 workaround better hardware doesn't need). The
+    // 6502 targets (gametank/nes/c64) keep the runtime + zp-staging fast path.
+    if (caps.nativeDiv) {
       if (fn === "gt_fmul") return `(long)(((long long)(${L}) * (${R})) >> 16)`;
       if (fn === "gt_fdiv") return `(long)((((long long)(${L})) << 16) / (${R}))`;
       // gt_ffmod handled at its own call site; other fns shouldn't reach here.
@@ -779,10 +805,11 @@ export function emit(chunk, symbols, file, opts = {}) {
       // is used as-is (a game that computes a 0-15 index will render wrong; the
       // GameTank palette differs from PICO-8's, documented best-effort).
       case "color": {
-        // GameTank: a static 0-15 P8 index bakes to its CAPTURE byte at compile
-        // time (the runtime takes a raw palette byte). GBA/Genesis: the runtime
-        // palette IS the PICO-8 16, so a color arg passes as its raw index.
-        if (isGametank && P8_PALETTE && a.kind === "number" &&
+        // colorBake targets (gametank/nes/c64): a static 0-15 P8 index bakes to
+        // its raw platform palette byte at compile time (the runtime takes a raw
+        // byte). Framebuffer targets (GBA/Genesis): the runtime palette IS the
+        // PICO-8 16, so a color arg passes as its raw index.
+        if (caps.colorBake && P8_PALETTE && a.kind === "number" &&
             Number.isInteger(a.value) && a.value >= 0 && a.value <= 15) {
           return String(P8_PALETTE[a.value]);
         }
@@ -1026,10 +1053,12 @@ export function emit(chunk, symbols, file, opts = {}) {
     // instead of paying cc65's C-stack push per argument. Skipped when an
     // argument expression could itself draw (a user-function call would
     // clobber the slots mid-sequence) - those sites use the cdecl wrapper.
-    // Only the GameTank has zero-page fastcall - GBA and Genesis skip the whole
-    // ZP-fastcall / camera / btn-inline optimization block: every builtin is a
-    // plain gba_*/md_* call handled by the b.c fallthrough below.
-    if (!isGametank && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
+    // Zero-page fastcall (the 6502 targets gametank/nes/c64): draw builtins
+    // stage their args into gt_a0.. and call the argless _z entry. The
+    // hardware-stack targets (GBA/Genesis, no zp) skip the whole ZP-fastcall /
+    // camera / btn-inline block: every builtin is a plain gba_*/md_* call from
+    // the b.c fallthrough below.
+    if (!caps.zpFastcall && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr packs its two flip flags into one int for the 5-param C signature
       // (same shape as the GameTank cdecl fallback), everything else is plain.
       if (name === "spr") {
@@ -1037,7 +1066,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       }
       return `${cName(b.c)}(${args.join(", ")})`;
     }
-    if (isGametank && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
+    if (caps.zpFastcall && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr has 7 params (n,x,y,w,h,flip_x,flip_y) but only 6 zp slots - pack
       // the two flip flags into gt_a5 as a bitmask (bit0 = X, bit1 = Y). The
       // asm reads gt_a5 to set WIDTH/HEIGHT bit7 + flip the GX/GY source edge.
@@ -1049,13 +1078,13 @@ export function emit(chunk, symbols, file, opts = {}) {
       const stores = args.map((a, i) => `gt_a${i} = ${a}`);
       return `(${stores.join(", ")}, ${ZP_BUILTINS[name]}())`;
     }
-    if (isGametank && name === "camera" && !e.args.some(hasUserCall)) {
+    if (caps.zpFastcall && name === "camera" && !e.args.some(hasUserCall)) {
       return `(gt_cam_x = ${args[0]}, gt_cam_y = ${args[1]})`;
     }
     // btn/btnp with constant button + player 0/1: an inline bit test on the
     // zp pad word - no call at all (233 measured cycles down to a handful).
-    // (GameTank only — GBA reads REG_KEYINPUT via a plain gba_btn call.)
-    if (isGametank && (name === "btn" || name === "btnp") && e.args[0]?.kind === "number") {
+    // (6502 zp targets only — GBA/Genesis read the pad via a plain call.)
+    if (caps.zpFastcall && (name === "btn" || name === "btnp") && e.args[0]?.kind === "number") {
       const idx = e.args[0].value | 0;
       const plArg = e.args[1];
       const plConst = !plArg ? 0 : (plArg.kind === "number" ? plArg.value | 0 : -1);
@@ -1528,6 +1557,8 @@ export function emit(chunk, symbols, file, opts = {}) {
 
   out.push(`/* generated by ${sdkName} from ${file} - edit the .lua, not this file */`);
   if (isMd) { out.push(`#include "md_api.h"`); out.push(`#include "md_math.h"`); }
+  else if (isNes) { out.push(`#include "nes_api.h"`); out.push(`#include "nes_math.h"`); }
+  else if (isC64) { out.push(`#include "c64_api.h"`); out.push(`#include "c64_math.h"`); }
   else out.push(isGba ? `#include "gba_api.h"` : `#include "gt_api.h"`);
   out.push("");
 
@@ -1799,6 +1830,60 @@ export function emit(chunk, symbols, file, opts = {}) {
     out.push("    return 0;");
     out.push("}");
     out.push("");
+  } else if (isNes) {
+    // NES harness (cc65). nes_init brings up the PPU + palette + font CHR and
+    // turns rendering on; the frame loop latches input (nes_update_inputs),
+    // clears the shadow-OAM sprite list, runs the callbacks (which stage sprites
+    // + queue nametable writes), then nes_endframe() = OAM-DMA + VRAM-queue drain
+    // at the NEXT vblank (ppu_wait_nmi). The STAGE-then-wait order is baked into
+    // the loop so a user can't hit the #1 NES sprite-flicker footgun (see docs).
+    // _update runs every OTHER frame at 30fps (PICO-8's default); _update60 and
+    // _draw run every frame.
+    out.push("void main(void)");
+    out.push("{");
+    out.push("    nes_init();");
+    if (symbols.usesAudio) out.push("    nes_audio_init();");
+    if (thirty) out.push("    unsigned char _nes_odd = 0;");
+    if (has("_init")) callCb("_init", "    ");
+    out.push("    for (;;) {");
+    out.push("        nes_update_inputs();");
+    out.push("        nes_oam_clear();");
+    if (has("_update60")) callCb("_update60", "        ");
+    if (thirty) {
+      out.push("        if (_nes_odd == 0) {");
+      callCb("_update", "            ");
+      out.push("        }");
+      out.push("        _nes_odd ^= 1;");
+    }
+    if (has("_draw")) callCb("_draw", "        ");
+    out.push("        nes_endframe();");
+    out.push("    }");
+    out.push("}");
+    out.push("");
+  } else if (isC64) {
+    // C64 harness (cc65). c64_init brings up the VIC-II bitmap surface + palette;
+    // the frame loop latches input, runs the callbacks (full framebuffer drawing),
+    // and flips at raster (c64_endframe). _update = 30fps, _update60/_draw = 60.
+    out.push("void main(void)");
+    out.push("{");
+    out.push("    c64_init();");
+    if (symbols.usesAudio) out.push("    c64_audio_init();");
+    if (thirty) out.push("    unsigned char _c64_odd = 0;");
+    if (has("_init")) callCb("_init", "    ");
+    out.push("    for (;;) {");
+    out.push("        c64_update_inputs();");
+    if (has("_update60")) callCb("_update60", "        ");
+    if (thirty) {
+      out.push("        if (_c64_odd == 0) {");
+      callCb("_update", "            ");
+      out.push("        }");
+      out.push("        _c64_odd ^= 1;");
+    }
+    if (has("_draw")) callCb("_draw", "        ");
+    out.push("        c64_endframe();");
+    out.push("    }");
+    out.push("}");
+    out.push("");
   } else {
     out.push("void main(void)");
     out.push("{");
@@ -1869,6 +1954,14 @@ export function emit(chunk, symbols, file, opts = {}) {
   if (banked) out.push(`#pragma rodata-name ("B1RODATA")`, "");
 
   let cUnit = out.join("\n");
-  if (isMd) cUnit = cUnit.replace(/\bgt_p8_/g, "md_").replace(/\bgt_/g, "md_");
+  // Prefixed targets (md/nes/c64) get a whole-unit gt_*→<prefix>_ collapse: it
+  // cleans up the special-form emissions (gt_mret_*, the gt_a*/gt_p* zp slots,
+  // gt_fmul_zp, ...) that bypass per-call cName. The framebuffer md target and
+  // the 6502 nes/c64 targets all rename to their own runtime schema. gametank
+  // keeps gt_* (prefix ""); gba's per-call cName is already complete.
+  if (caps.prefix && (isMd || isNes || isC64)) {
+    const p = caps.prefix + "_";
+    cUnit = cUnit.replace(/\bgt_p8_/g, p).replace(/\bgt_/g, p);
+  }
   return { c: cUnit, callGraph, stubs };
 }

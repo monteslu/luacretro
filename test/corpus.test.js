@@ -27,7 +27,9 @@ const CORPUS = {
   color: `function _draw() cls(1) rectfill(0,0,10,10,8) end`,
 };
 
-for (const target of ["gametank", "gba", "md"]) {
+// All five targets compile the corpus. The 6502 targets (gametank/nes/c64) and
+// the framebuffer targets (gba/md) share the front-end; the seams differ.
+for (const target of ["gametank", "gba", "md", "nes", "c64"]) {
   const opts = { target, sdkName: "luacretro", builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE };
   for (const [name, src] of Object.entries(CORPUS)) {
     test(`${name} compiles for ${target}`, () => {
@@ -37,6 +39,34 @@ for (const target of ["gametank", "gba", "md"]) {
     });
   }
 }
+
+// The 6502 targets bake color like gametank; nes/c64 rename to their own schema.
+test("nes bakes color + renames to nes_ schema", () => {
+  const r = compile(`function _draw() cls(1) rectfill(0,0,10,10,8) end`, "t.lua",
+    { target: "nes", sdkName: "neslua", builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE });
+  assert.ok(r.ok, (r.diagnostics || []).map(d => d.message).join("\n"));
+  assert.match(r.c, /nes_cls\(169\)/);      // P8 index 1 -> baked byte, nes_ prefix
+  assert.match(r.c, /#include "nes_api.h"/);
+  assert.doesNotMatch(r.c, /\bgt_/);         // no gt_ symbols leak through
+});
+
+test("c64 bakes color + renames to c64_ schema + native div", () => {
+  const r = compile(`local a=0\nfunction _update() a=a\\3 end\nfunction _draw() cls(1) end`, "t.lua",
+    { target: "c64", sdkName: "c64lua", builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE });
+  assert.ok(r.ok, (r.diagnostics || []).map(d => d.message).join("\n"));
+  assert.match(r.c, /#include "c64_api.h"/);
+  assert.doesNotMatch(r.c, /\bgt_/);
+});
+
+// per-target static-allocation limits (opts.limits) tighten diagnostics only.
+test("opts.limits tightens array/pool caps", () => {
+  const src = `local a=array(200)\nfunction _update() end\nfunction _draw() end`;
+  const wide = compile(src, "t.lua", { target: "nes", builtins: CORE, callbacks: CALLBACKS });
+  assert.ok(wide.ok);
+  const tight = compile(src, "t.lua", { target: "nes", builtins: CORE, callbacks: CALLBACKS, limits: { arrayMax: 128 } });
+  assert.ok(!tight.ok);
+  assert.match(tight.diagnostics.map(d => d.message).join("\n"), /between 1 and 128/);
+});
 
 // Target seams fire distinctly.
 test("gametank bakes color; gba/md pass raw", () => {

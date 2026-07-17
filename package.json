@@ -1,7 +1,7 @@
 {
   "name": "luacretro",
   "version": "0.0.1",
-  "description": "The shared Lua compiler front-end for the gtlua / gbalua / mdlua console SDKs: a PICO-8-flavored Lua subset compiled to C for GameTank (6502), Game Boy Advance (ARM), and Sega Genesis (68000).",
+  "description": "The shared Lua compiler front-end for the gtlua / gbalua / mdlua / neslua / c64lua console SDKs: a PICO-8-flavored Lua subset compiled to C for GameTank (6502), Game Boy Advance (ARM), Sega Genesis (68000), NES (6502), and Commodore 64 (6510).",
   "type": "module",
   "license": "MIT",
   "author": "Luis Montes",

@@ -18,6 +18,15 @@ export function check(chunk, file, opts = {}) {
   const CALLBACKS = opts.callbacks || [];
   const GT_MEMBERS = opts.members || null;  // gt.* namespace: gametank only
   const sdkName = opts.sdkName || "luacretro";
+  // Per-target static-allocation caps. An SDK whose RAM is tighter (NES: 8KB
+  // PRG-RAM; C64: full RAM) passes its own ceilings via opts.limits; the
+  // defaults preserve the historical gtlua/gbalua/mdlua numbers exactly (so
+  // those SDKs' goldens are untouched). Only diagnostics change, never codegen.
+  const LIMITS = {
+    arrayMax: opts.limits?.arrayMax ?? 4096,   // array(n)/array8(n) capacity
+    poolMax: opts.limits?.poolMax ?? 64,       // pool(n) capacity
+    ...(opts.limits || {}),
+  };
   const diagnostics = [];
   const globals = new Map();   // name -> {kind, fixedInit, node}
   const usesAudio = { flag: false };
@@ -82,8 +91,8 @@ export function check(chunk, file, opts = {}) {
         // struct pool: local bullets = pool(N)
         if (init && init.kind === "call" && init.callee.kind === "name" && init.callee.name === "pool") {
           const size = constEval(init.args[0]);
-          if (size === null || !Number.isInteger(size) || size < 1 || size > 64) {
-            err(s, "pool(n) needs a constant capacity between 1 and 64");
+          if (size === null || !Number.isInteger(size) || size < 1 || size > LIMITS.poolMax) {
+            err(s, `pool(n) needs a constant capacity between 1 and ${LIMITS.poolMax}`);
           }
           // pool(n, "f1,f2,...") - the listed fields are DECLARED byte-wide
           // (values 0-255, stored in one byte, ~2-3x faster per access on
@@ -143,8 +152,8 @@ export function check(chunk, file, opts = {}) {
           const bytes = init.callee.name === "array8";
           const size = constEval(init.args[0]);
           const iv = init.args[1] ? constEval(init.args[1]) : 0;
-          if (size === null || !Number.isInteger(size) || size < 1 || size > 4096) {
-            err(s, `${init.callee.name}(n) needs a constant capacity between 1 and 4096`);
+          if (size === null || !Number.isInteger(size) || size < 1 || size > LIMITS.arrayMax) {
+            err(s, `${init.callee.name}(n) needs a constant capacity between 1 and ${LIMITS.arrayMax}`);
           }
           if (init.args[1] && iv === null) {
             err(s, `${init.callee.name}(n, v) initial value must be a constant`);
