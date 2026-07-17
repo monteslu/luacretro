@@ -1,0 +1,21 @@
+{
+  "name": "luacretro",
+  "version": "0.0.1",
+  "description": "The shared Lua compiler front-end for the gtlua / gbalua / mdlua console SDKs: a PICO-8-flavored Lua subset compiled to C for GameTank (6502), Game Boy Advance (ARM), and Sega Genesis (68000).",
+  "type": "module",
+  "license": "MIT",
+  "author": "Luis Montes",
+  "engines": { "node": ">=24" },
+  "exports": {
+    ".": "./compiler/index.js",
+    "./lexer": "./compiler/lexer.js",
+    "./parser": "./compiler/parser.js",
+    "./check": "./compiler/check.js",
+    "./emit": "./compiler/emit.js",
+    "./peephole": "./compiler/peephole.js",
+    "./core-builtins": "./compiler/core-builtins.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["compiler", "README.md", "LICENSE", "SPEC.md"],
+  "scripts": { "test": "node --test 'test/**/*.test.js'" }
+}
