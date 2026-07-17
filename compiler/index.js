@@ -1,4 +1,9 @@
-// gtlua compiler entry - source text in, C text (or diagnostics) out.
+// luacretro compiler entry - source text in, C text (or diagnostics) out.
+//
+// The shared Lua front-end for the gtlua / gbalua / mdlua console SDKs. Each
+// SDK calls compile() with its target + its builtin tables (passed via opts),
+// so this package stays platform-agnostic and byte-identical to the SDKs'
+// previous in-tree front-ends.
 
 import { lex } from "./lexer.js";
 import { parse } from "./parser.js";
@@ -10,18 +15,21 @@ import { emit } from "./emit.js";
  */
 
 /**
- * Compile gtlua source to C.
+ * Compile PICO-8-flavored Lua to C for a console target.
  * @param {string} source
- * @param {string} file name used in diagnostics
- * @param {object} [opts] - {banked:true, placement:{fnName:"fixed"|"b0"|"b1"|"b2"}}
- *   enables the FLASH2M banked build: functions land in per-bank segments and
- *   cross-bank calls are routed through generated far-call stubs.
- * @returns {{ok: boolean, c: string|null, diagnostics: Diagnostic[],
- *            callGraph?: Map<string,Set<string>>, stubs?: string|null}}
+ * @param {string} file  name used in diagnostics
+ * @param {object} [opts]
+ *   - target: "gametank" | "gba" | "md"  (selects codegen)
+ *   - sdkName: "gtlua" | "gbalua" | "mdlua"  (diagnostic + generated-by text)
+ *   - builtins, members, callbacks: the SDK's merged tables
+ *   - p8Palette, nearestColorByte: GameTank color tooling (gametank only)
+ *   - banked, placement, num8, inliner: GameTank build knobs (passthrough)
+ * @returns {{ok, c, diagnostics, callGraph?, stubs?}}
  */
 export function compile(source, file = "main.lua", opts = {}) {
+  const sdkName = opts.sdkName;
   const { tokens, diagnostics: lexDiags } = lex(source, file);
-  const { chunk, diagnostics: parseDiags } = parse(tokens, file);
+  const { chunk, diagnostics: parseDiags } = parse(tokens, file, sdkName);
   const diagnostics = [...lexDiags, ...parseDiags];
 
   // Don't typecheck a broken parse - the errors would be noise.
@@ -29,7 +37,7 @@ export function compile(source, file = "main.lua", opts = {}) {
     return { ok: false, c: null, diagnostics };
   }
 
-  const { diagnostics: checkDiags, symbols } = check(chunk, file);
+  const { diagnostics: checkDiags, symbols } = check(chunk, file, opts);
   diagnostics.push(...checkDiags);
   if (diagnostics.some((d) => d.severity === "error")) {
     return { ok: false, c: null, diagnostics };

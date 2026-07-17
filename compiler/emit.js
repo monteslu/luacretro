@@ -1,4 +1,5 @@
-// gbalua C emitter - lowers the checked AST to cc65-flavored C89.
+// luacretro C emitter - lowers the checked AST to C for GameTank (cc65),
+// GBA (arm-gcc), or Genesis (m68k-gcc). Shared front-end for the 3 Lua SDKs.
 //
 // Numeric kinds map to C types: int -> `int` (16-bit), fixed -> `long`
 // (32-bit 16.16). Conversions are explicit and single-evaluation:
@@ -7,7 +8,6 @@
 // Fixed multiply/divide/mod go through the gt_f* runtime; power-of-two
 // divisors fold to shifts/masks at compile time (exact for 16.16).
 
-import { BUILTINS, CALLBACKS } from "./builtins.js";
 
 // Split an index expression into (base, constant offset): `x + 3` -> [x, 3],
 // `x - 2` -> [x, -2], `5` -> [null, 5], anything else -> [expr, 0]. Lets the
@@ -259,20 +259,34 @@ function touchesFixedRuntime(node) {
 }
 
 export function emit(chunk, symbols, file, opts = {}) {
+  const BUILTINS = opts.builtins || {};
+  const CALLBACKS = opts.callbacks || [];
+  const GT_MEMBERS = opts.members || null;
+  const sdkName = opts.sdkName || "luacretro";
+  // gametank color tooling (SDK-provided; only the gametank target bakes colors)
+  const P8_PALETTE = opts.p8Palette || null;
+  const nearestColorByte = opts.nearestColorByte || null;
   // This SDK targets the GBA only (arm-gcc / libtonc / maxmod). `target` defaults
   // to "gba"; the front-end (lex/parse/check) + arg lowering is target-independent,
   // and every draw builtin is a plain gba_*(args) call (no zero-page fastcall ABI).
-  const target = opts.target === "gametank" ? "gametank" : "gba";
+  const target = opts.target === "gametank" ? "gametank"
+               : opts.target === "md" ? "md" : "gba";
   const isGba = target === "gba";
+  const isGametank = target === "gametank";
+  const isMd = target === "md";
   // GBA reuses the builtins table verbatim; only the C SYMBOL a verb resolves to
   // differs. The GameTank runtime names everything gt_p8_* / gt_*; the GBA
   // runtime (gba_api.c) mirrors the same set as gba_*. Remap at the call site so
   // the table stays single-source (no forked builtins.js).
   const cName = (c) => {
-    if (!isGba || !c) return c;
-    return c.replace(/^gt_p8_/, "gba_").replace(/^gt_/, "gba_");
+    if (!c) return c;
+    // GameTank keeps the gt_p8_*/gt_* schema names verbatim (identity).
+    if (isGba) return c.replace(/^gt_p8_/, "gba_").replace(/^gt_/, "gba_");
+    if (isMd) return c.replace(/^gt_p8_/, "md_").replace(/^gt_/, "md_");
+    return c;
   };
-  const banked = opts.banked === true && !isGba;   // GBA is flat: never banked
+  // Only the GameTank has a banked (FLASH2M) build; GBA/Genesis are flat.
+  const banked = opts.banked === true && isGametank;
   const placement = opts.placement ?? {};
   const bankOf = (name) => (banked ? (placement[name] ?? "fixed") : "fixed");
   const out = [];
@@ -395,7 +409,11 @@ export function emit(chunk, symbols, file, opts = {}) {
   // the AST call graph is the complete truth.
   const liveFns = new Set();
   {
-    const stack = ["_init", "_update", "_update60", "_draw"].filter((n) => functions.has(n));
+    // roots: the lifecycle callbacks + any function whose ADDRESS was taken as a
+    // callback arg (fn kind) - those are reachable indirectly via SGDK.
+    const roots = ["_init", "_update", "_update60", "_draw"].filter((n) => functions.has(n));
+    for (const [n, f] of functions) if (f.addressTaken) roots.push(n);
+    const stack = roots;
     while (stack.length) {
       const n = stack.pop();
       if (liveFns.has(n)) continue;
@@ -626,8 +644,8 @@ export function emit(chunk, symbols, file, opts = {}) {
           return cv(N8 ? `(${expr(e.left, "fixed")} >> ${8 + lg})`
                        : `(int)(${expr(e.left, "fixed")} >> ${16 + lg})`, "int", want);
         }
-        // GBA: native integer division (hardware). GameTank: runtime helper.
-        if (ok === "int") return cv(isGba
+        // GBA/Genesis: native integer division (hardware). GameTank: runtime helper.
+        if (ok === "int") return cv(!isGametank
           ? `((${expr(e.left, "int")}) / (${expr(e.right, "int")}))`
           : `gt_ifdiv(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
         return cv(N8 ? `(${fixedCall("gt_fdiv", e.left, e.right)} >> 8)`
@@ -638,8 +656,8 @@ export function emit(chunk, symbols, file, opts = {}) {
           if (k === "int") return cv(`(${expr(e.left, "int")} & ${e.divConst - 1})`, "int", want);
           return cv(`(${expr(e.left, "fixed")} & ${(e.divConst * FONE) - 1}${FL})`, "fixed", want);
         }
-        // GBA: native modulo (hardware divide). GameTank: runtime helpers.
-        if (isGba) {
+        // GBA/Genesis: native modulo (hardware divide). GameTank: runtime helpers.
+        if (!isGametank) {
           if (k === "int") return cv(`((${expr(e.left, "int")}) % (${expr(e.right, "int")}))`, "int", want);
           // 16.16 fixed modulo == a % b on the raw fixed ints (fraction preserved).
           return cv(`((${expr(e.left, "fixed")}) % (${expr(e.right, "fixed")}))`, "fixed", want);
@@ -674,12 +692,11 @@ export function emit(chunk, symbols, file, opts = {}) {
   function fixedCall(fn, left, right) {
     const L = expr(left, "fixed");
     const R = expr(right, "fixed");
-    // GBA: 16.16 fixed mul/div are NATIVE C via a 64-bit intermediate — the
-    // ARM7TDMI has a hardware multiplier + fast divide, so no runtime call and
+    // GBA/Genesis: 16.16 fixed mul/div are NATIVE C via a 64-bit intermediate —
+    // the ARM7 and 68000 have hardware multiply + divide, so no runtime call and
     // no zero-page staging (the whole gt_fmul/gt_fdiv/fa/fb apparatus is a 6502
-    // workaround the GBA doesn't need). This is the number model going faster +
-    // simpler on better hardware, exactly as planned.
-    if (isGba) {
+    // workaround better hardware doesn't need).
+    if (!isGametank) {
       if (fn === "gt_fmul") return `(long)(((long long)(${L}) * (${R})) >> 16)`;
       if (fn === "gt_fdiv") return `(long)((((long long)(${L})) << 16) / (${R}))`;
       // gt_ffmod handled at its own call site; other fns shouldn't reach here.
@@ -762,12 +779,24 @@ export function emit(chunk, symbols, file, opts = {}) {
       // is used as-is (a game that computes a 0-15 index will render wrong; the
       // GameTank palette differs from PICO-8's, documented best-effort).
       case "color": {
-        // The GBA runtime palette IS the PICO-8 16-color palette indexed 0..15,
-        // so a color arg passes through as its raw index (no compile-time bake).
+        // GameTank: a static 0-15 P8 index bakes to its CAPTURE byte at compile
+        // time (the runtime takes a raw palette byte). GBA/Genesis: the runtime
+        // palette IS the PICO-8 16, so a color arg passes as its raw index.
+        if (isGametank && P8_PALETTE && a.kind === "number" &&
+            Number.isInteger(a.value) && a.value >= 0 && a.value <= 15) {
+          return String(P8_PALETTE[a.value]);
+        }
         return expr(a, "int");
       }
       // pass an array global by pointer: the bare mangled name decays to
       // int*/long* (the checker validated it's an array reference).
+      // a callback: the address of a top-level Lua function (checker validated).
+      // Flat ROM makes the indirect call safe; the ref keeps the call graph
+      // complete. Cast to void* so it fits any SGDK callback pointer type.
+      case "fn": return a.callbackRef ? `(void*)&${mangle(a.callbackRef)}` : "0";
+      // an opaque POINTER handle (Sprite*, sample blob, ...) carried as an int.
+      // Cast to void* so it fits the SGDK prototype's pointer type under -Werror.
+      case "optr": return `(void*)(${expr(a, "int")})`;
       case "array":
       case "array8": return a.kind === "name" ? mangle(a.name) : "0";
       // a flip flag: any truthy value -> 1, else 0 (packed by the caller).
@@ -779,13 +808,80 @@ export function emit(chunk, symbols, file, opts = {}) {
   function call(e) {
     const callee = e.callee;
 
-    // gt.* was the GameTank-only namespace; it does not exist on the GBA (the GBA
-    // exposes its hardware as first-class verbs instead). Refuse it loudly.
+    // gt.* extras (gametank only)
     if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === "gt") {
-      throw new Error(
-        `'gt.${callee.field}' is a GameTank-only verb and isn't available on the GBA - ` +
-        `use the GBA verbs instead (see docs/CHEATSHEET.md).`,
-      );
+      // gt.* is a GameTank-only namespace (the SDK passes a GT_MEMBERS table);
+      // on gba/md there is no such escape hatch.
+      if (!isGametank || !GT_MEMBERS) {
+        throw new Error(
+          `'gt.${callee.field}' is a GameTank-only verb and isn't available on this platform - ` +
+          `use the platform's verbs instead (see docs/CHEATSHEET.md).`,
+        );
+      }
+      const sig = GT_MEMBERS[callee.field];
+      if (sig.special === "rgb") {
+        // gt.rgb(r,g,b) / gt.rgb(byte): a raw GameTank palette byte (0-255).
+        // (r,g,b) resolves to the nearest byte at COMPILE time (zero runtime
+        // cost - the checker proved the 3 args constant); (byte) masks to 8 bits.
+        if (e.args.length === 3) {
+          const r = Math.round(constFold(e.args[0]) ?? 0);
+          const g = Math.round(constFold(e.args[1]) ?? 0);
+          const b = Math.round(constFold(e.args[2]) ?? 0);
+          return `0x${nearestColorByte(r, g, b).toString(16)}`;
+        }
+        return `(${argAt(e, 0, "int", "0")} & 0xFF)`;
+      }
+      if (sig.isValue) return sig.c;
+      if (sig.special === "hitscan") {
+        const A = e.args[0].sym, B = e.args[3].sym;
+        const fw = e.args[1].value, fh = e.args[2].value, fbw = e.args[4].value;
+        const bh = expr(e.args[5], "int"), sh = expr(e.args[6], "int");
+        const pr = expr(e.args[7], "int");
+        return `gt_hit_scan(${A.cname}_x, ${A.cname}_y, ${A.cname}_${fw}, ${A.cname}_${fh}, ${A.cname}_used, ${A.cname}_hi, ${B.cname}_x, ${B.cname}_y, ${B.cname}_${fbw}, ${B.cname}_used, ${B.cname}_hi, ${bh}, ${sh}, ${pr})`;
+      }
+      if (sig.special === "dbar") {
+        const names = ["db_px", "db_py", "db_v", "db_m", "db_c", "db_c2", "db_bg"];
+        // positions 4,5,6 (db_c, db_c2, db_bg) are colors: bake a static 0-15
+        // literal to its GameTank byte, like a `color` arg; else pass raw.
+        const isColor = (i) => i >= 4;
+        const parts = e.args.map((a, i) => {
+          const v = (isColor(i) && a.kind === "number" && Number.isInteger(a.value) &&
+                     a.value >= 0 && a.value <= 15)
+            ? String(P8_PALETTE[a.value]) : expr(a, "int");
+          return `${names[i]} = (unsigned char)(${v})`;
+        });
+        return `(${parts.join(", ")}, gt_dbar_z())`;
+      }
+      if (sig.special === "partsstep") {
+        const pl = e.args[0].sym;
+        return `gt_parts_step(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_vx, ${pl.cname}_vy, ${pl.cname}_used, ${pl.cname}_hi)`;
+      }
+      if (sig.special === "poolsprs") {
+        const pl = e.args[0].sym;
+        const fld = e.args[1].value;
+        const ox = e.args[2] ? expr(e.args[2], "int") : "0";
+        const oy = e.args[3] ? expr(e.args[3], "int") : "0";
+        return `gt_pool_sprs(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_used, ${pl.cname}_${fld}, ${pl.cname}_hi, ${ox}, ${oy})`;
+      }
+      if (sig.special === "poolmove") {
+        const pl = e.args[0].sym;
+        const mode = expr(e.args[1], "int");
+        return `gt_pool_move(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_sx, ${pl.cname}_sy, ${pl.cname}_used, ${pl.cname}_hi, ${mode})`;
+      }
+      if (sig.special === "poolanim") {
+        const pl = e.args[0].sym;
+        const f = e.args[1].value, sp = e.args[2].value, mx = e.args[3].value;
+        const rst = e.args[4] ? expr(e.args[4], "int") : "16";   // reset frame (16ths; 16 = first)
+        return `gt_pool_anim(${pl.cname}_${f}, ${pl.cname}_${sp}, ${pl.cname}_${mx}, ${pl.cname}_used, ${pl.cname}_hi, ${rst})`;
+      }
+      if (sig.special === "pooledraw") {
+        const pl = e.args[0].sym;
+        const an = e.args[1].value, ty = e.args[2].value, fl = e.args[3].value, sh = e.args[4].value;
+        const desc = expr(e.args[5], "array");
+        const nud = expr(e.args[6], "int");
+        return `gt_pool_edraw(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_${an}, ${pl.cname}_${ty}, ${pl.cname}_${fl}, ${pl.cname}_${sh}, ${pl.cname}_used, ${pl.cname}_hi, ${desc}, ${nud})`;
+      }
+      return `${sig.c}(${sig.params.map((p, i) => argAt(e, i, p[0], defaultFor(callee.field, i))).join(", ")})`;
     }
 
     // user function - cross-bank calls go through a fixed-bank far-call stub
@@ -930,10 +1026,10 @@ export function emit(chunk, symbols, file, opts = {}) {
     // instead of paying cc65's C-stack push per argument. Skipped when an
     // argument expression could itself draw (a user-function call would
     // clobber the slots mid-sequence) - those sites use the cdecl wrapper.
-    // GBA: no zero-page, so the whole ZP-fastcall / camera / btn-inline
-    // optimization block is skipped — every builtin is a plain gba_*(args) call
-    // handled by the b.c fallthrough below.
-    if (isGba && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
+    // Only the GameTank has zero-page fastcall - GBA and Genesis skip the whole
+    // ZP-fastcall / camera / btn-inline optimization block: every builtin is a
+    // plain gba_*/md_* call handled by the b.c fallthrough below.
+    if (!isGametank && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr packs its two flip flags into one int for the 5-param C signature
       // (same shape as the GameTank cdecl fallback), everything else is plain.
       if (name === "spr") {
@@ -941,7 +1037,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       }
       return `${cName(b.c)}(${args.join(", ")})`;
     }
-    if (!isGba && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
+    if (isGametank && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr has 7 params (n,x,y,w,h,flip_x,flip_y) but only 6 zp slots - pack
       // the two flip flags into gt_a5 as a bitmask (bit0 = X, bit1 = Y). The
       // asm reads gt_a5 to set WIDTH/HEIGHT bit7 + flip the GX/GY source edge.
@@ -953,13 +1049,13 @@ export function emit(chunk, symbols, file, opts = {}) {
       const stores = args.map((a, i) => `gt_a${i} = ${a}`);
       return `(${stores.join(", ")}, ${ZP_BUILTINS[name]}())`;
     }
-    if (!isGba && name === "camera" && !e.args.some(hasUserCall)) {
+    if (isGametank && name === "camera" && !e.args.some(hasUserCall)) {
       return `(gt_cam_x = ${args[0]}, gt_cam_y = ${args[1]})`;
     }
     // btn/btnp with constant button + player 0/1: an inline bit test on the
     // zp pad word - no call at all (233 measured cycles down to a handful).
     // (GameTank only — GBA reads REG_KEYINPUT via a plain gba_btn call.)
-    if (!isGba && (name === "btn" || name === "btnp") && e.args[0]?.kind === "number") {
+    if (isGametank && (name === "btn" || name === "btnp") && e.args[0]?.kind === "number") {
       const idx = e.args[0].value | 0;
       const plArg = e.args[1];
       const plConst = !plArg ? 0 : (plArg.kind === "number" ? plArg.value | 0 : -1);
@@ -977,6 +1073,9 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (name === "sprf") {
       return `${cName(b.c)}(${args[0]}, ${args[1]}, ${args[2]}, ${args[3]} | (${args[4]} << 1))`;
     }
+    // a pointer-returning SGDK call (retptr) hands back a Sprite*/Map*/... - cast
+    // it to int so the handle assigns cleanly to an int global under -Werror.
+    if (b.retptr) return `(int)${cName(b.c)}(${args.join(", ")})`;
     return `${cName(b.c)}(${args.join(", ")})`;
   }
 
@@ -1427,8 +1526,9 @@ export function emit(chunk, symbols, file, opts = {}) {
 
   let currentFn = null;
 
-  out.push(`/* generated by gbalua from ${file} - edit the .lua, not this file */`);
-  out.push(isGba ? `#include "gba_api.h"` : `#include "gt_api.h"`);
+  out.push(`/* generated by ${sdkName} from ${file} - edit the .lua, not this file */`);
+  if (isMd) { out.push(`#include "md_api.h"`); out.push(`#include "md_math.h"`); }
+  else out.push(isGba ? `#include "gba_api.h"` : `#include "gt_api.h"`);
   out.push("");
 
   // banked builds: functions get external linkage (the far-call stubs in
@@ -1653,7 +1753,34 @@ export function emit(chunk, symbols, file, opts = {}) {
     }
     out.push(`${ind}${mangle(name)}();`);
   };
-  if (isGba) {
+  if (isMd) {
+    // SGDK harness: md_init brings up the VDP + palette + tiles, then the frame
+    // loop latches input (md_vsync), runs the callbacks, draws, and flushes the
+    // SAT + palette + raster tables at vblank (md_endframe). _update60 runs every
+    // frame (60 Hz); _update runs every OTHER frame (30 Hz, PICO-8's default) so
+    // ports written for 30 fps keep their timing. _draw + endframe are 60 Hz.
+    out.push("int main(bool hard)");
+    out.push("{");
+    out.push("    (void)hard;");
+    out.push("    md_init();");
+    if (has("_init")) callCb("_init", "    ");
+    if (thirty) out.push("    unsigned char _md_odd = 0;");
+    out.push("    for (;;) {");
+    out.push("        md_vsync();");        // latch input, reset sprite list
+    if (has("_update60")) callCb("_update60", "        ");
+    if (thirty) {
+      out.push("        if (_md_odd == 0) {");
+      callCb("_update", "            ");
+      out.push("        }");
+      out.push("        _md_odd ^= 1;");
+    }
+    if (has("_draw")) callCb("_draw", "        ");
+    out.push("        md_endframe();");     // SAT + palette flush, vblank sync
+    out.push("    }");
+    out.push("    return 0;");
+    out.push("}");
+    out.push("");
+  } else if (isGba) {
     // libtonc harness: install the vblank IRQ (THE #1 GBA footgun — before the
     // first VBlankIntrWait), let the runtime bring up video, then the frame loop
     // reads input, runs the callbacks, and flushes OAM at vblank. All the moving
@@ -1700,7 +1827,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   let stubs = null;
   if (banked && stubbed.size) {
     const st = [];
-    st.push("; generated by gbalua - FLASH2M cross-bank far-call stubs");
+    st.push(`; generated by ${sdkName} - FLASH2M cross-bank far-call stubs`);
     st.push(".PC02");
     st.push(".import gt_bank_raw, gt_cur_bank");
     for (const cn of stubbed) st.push(`.import _${mangle(cn)}`);
@@ -1741,5 +1868,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   // A tail pragma routes the pool into bank 1 with the draw-path code.
   if (banked) out.push(`#pragma rodata-name ("B1RODATA")`, "");
 
-  return { c: out.join("\n"), callGraph, stubs };
+  let cUnit = out.join("\n");
+  if (isMd) cUnit = cUnit.replace(/\bgt_p8_/g, "md_").replace(/\bgt_/g, "md_");
+  return { c: cUnit, callGraph, stubs };
 }

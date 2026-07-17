@@ -1,4 +1,5 @@
-// gbalua semantic checker - scopes, arity, and the numeric-kind system.
+// luacretro semantic checker - scopes, arity, the int/fixed numeric-kind
+// system. Shared front-end for gtlua / gbalua / mdlua.
 //
 // Numbers are PICO-8 16.16 fixed point semantically. The compiler tracks two
 // KINDS underneath: "int" (provably integral, 16-bit C int - fast on the
@@ -9,11 +10,14 @@
 //
 // Conditions must be boolean (deliberate wall: Lua's 0 is truthy, C's is not).
 
-import { BUILTINS, CALLBACKS } from "./builtins.js";
 
 const join = (a, b) => (a === "fixed" || b === "fixed") ? "fixed" : "int";
 
-export function check(chunk, file) {
+export function check(chunk, file, opts = {}) {
+  const BUILTINS = opts.builtins || {};
+  const CALLBACKS = opts.callbacks || [];
+  const GT_MEMBERS = opts.members || null;  // gt.* namespace: gametank only
+  const sdkName = opts.sdkName || "luacretro";
   const diagnostics = [];
   const globals = new Map();   // name -> {kind, fixedInit, node}
   const usesAudio = { flag: false };
@@ -396,7 +400,7 @@ export function check(chunk, file) {
           }
           const sym = lookup(s.target.name);
           if (!sym) {
-            err(s, `'${s.target.name}' is not declared - gbalua has no implicit globals; ` +
+            err(s, `'${s.target.name}' is not declared - ${sdkName} has no implicit globals; ` +
                    `declare it with 'local ${s.target.name} = ...'`);
             break;
           }
@@ -679,7 +683,7 @@ export function check(chunk, file) {
       const t = typeOf(e);
       if (t !== "bool") {
         err(e, "conditions must be boolean - PICO-8 Lua treats 0 as true but compiled C does not, " +
-               "so gbalua requires an explicit comparison (write 'x ~= 0' or 'x > 0')");
+               `so ${sdkName} requires an explicit comparison (write 'x ~= 0' or 'x > 0')`);
       }
     }
 
@@ -687,11 +691,30 @@ export function check(chunk, file) {
     function callType(call, asStatement = false) {
       const callee = call.callee;
 
-      // gt.* was the GameTank-only namespace; the GBA has no such escape hatch
-      // (its hardware is first-class verbs). Reject it with a pointer to the docs.
+      // gt.* namespace: gametank exposes engine verbs here (the SDK passes a
+      // GT_MEMBERS table). On gba/md there is no such escape hatch - reject it.
       if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === "gt") {
-        err(call, `'gt.${callee.field}' is a GameTank-only verb and isn't available on the GBA - use the GBA verbs instead (see docs/CHEATSHEET.md)`);
-        return "int";
+        if (!GT_MEMBERS) {
+          err(call, `'gt.${callee.field}' is a GameTank-only verb and isn't available on this platform - use the platform's verbs instead (see docs/CHEATSHEET.md)`);
+          return "int";
+        }
+        const sig = GT_MEMBERS[callee.field];
+        if (!sig) { err(call, `unknown gt function 'gt.${callee.field}'`); return "int"; }
+        if (sig.audio) usesAudio.flag = true;
+        // gt.rgb has two forms: gt.rgb(byte) raw, or gt.rgb(r,g,b) resolved to
+        // the nearest palette byte at compile time (r,g,b must be constants).
+        if (callee.field === "rgb" && call.args.length === 3) {
+          for (const a of call.args) {
+            if (constEval(a) === null) {
+              err(a, "gt.rgb(r, g, b) needs constant 0-255 values (use gt.rgb(byte) for a runtime color)");
+            } else typeOf(a);
+          }
+          call.sig = sig;
+          return sig.ret;
+        }
+        checkArgs(call, sig.params, `gt.${callee.field}`);
+        call.sig = sig;
+        return sig.ret;
       }
 
       if (callee.kind !== "name") {
@@ -897,7 +920,7 @@ export function check(chunk, file) {
           const sym = lookup(e.name);
           if (!sym) {
             if (functions.has(e.name)) {
-              err(e, `'${e.name}' is a function - functions are not values in gbalua (no closures); call it`);
+              err(e, `'${e.name}' is a function - functions are not values in ${sdkName} (no closures); call it`);
             } else if (BUILTINS[e.name]) {
               err(e, `'${e.name}' is a builtin function - call it: ${e.name}(...)`);
             } else if (e.name === "gt") {
@@ -912,7 +935,12 @@ export function check(chunk, file) {
         }
         case "member": {
           if (e.object.kind === "name" && e.object.name === "gt") {
-            err(e, `'gt.${e.field}' is a GameTank-only verb and isn't available on the GBA (see docs/CHEATSHEET.md)`);
+            if (GT_MEMBERS) {
+              if (GT_MEMBERS[e.field]) { err(e, `gt.${e.field} must be called: gt.${e.field}(...)`); return "int"; }
+              err(e, `unknown gt member 'gt.${e.field}'`);
+              return "int";
+            }
+            err(e, `'gt.${e.field}' is a GameTank-only verb and isn't available on this platform (see docs/CHEATSHEET.md)`);
             return "int";
           }
           if (e.object.kind === "name") {
@@ -995,7 +1023,7 @@ export function check(chunk, file) {
       if (op === "and" || op === "or") {
         const lt = typeOf(e.left), rt = typeOf(e.right);
         if (lt !== "bool" || rt !== "bool") {
-          err(e, `'${op}' needs boolean operands (PICO-8's 'x or default' value idiom needs nil, which gbalua doesn't have)`);
+          err(e, `'${op}' needs boolean operands (PICO-8's 'x or default' value idiom needs nil, which ${sdkName} doesn't have)`);
         }
         return "bool";
       }
