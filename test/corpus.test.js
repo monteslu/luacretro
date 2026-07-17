@@ -1,0 +1,63 @@
+import { test } from "node:test";
+import assert from "node:assert";
+import { compile } from "../compiler/index.js";
+
+// Minimal per-target builtin tables (enough to exercise the shared paths
+// without vendoring the whole SDK tables). Real byte-identity is gated in each
+// SDK's own suite via test/golden-c; this proves the front-end compiles for
+// every target and the target seams fire correctly.
+const CORE = {
+  cls:      { params: [["color", true]], ret: "void", c: "gt_p8_cls" },
+  rectfill: { params: [["coord", false], ["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "gt_p8_rectfill" },
+  circfill: { params: [["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "gt_p8_circfill" },
+  print:    { params: [["str", false], ["coord", true], ["coord", true], ["color", true]], ret: "void", c: "gt_p8_print" },
+  btn:      { params: [["int", false]], ret: "bool", c: "gt_p8_btn" },
+  min:      { params: [["num", false], ["num", false]], ret: "same", special: "min" },
+  flr:      { params: [["num", false]], ret: "int", special: "flr" },
+};
+const CALLBACKS = ["_init", "_update", "_update60", "_draw"];
+const P8_PALETTE = [0,169,90,219,51,3,6,7,91,62,31,254,190,140,94,47];
+
+const CORPUS = {
+  hello: `function _draw() cls(1) print("hi",4,4,7) circfill(64,64,10,10) end`,
+  fixedmath: `local x=0.0\nfunction _update() x+=0.5 x=x/3 x%=2 end\nfunction _draw() end`,
+  fornum: `function _update() for i=0,10 do end for j=1,20,2 do end end\nfunction _draw() end`,
+  cond: `local n=0\nfunction _update() if btn(0) then n+=1 end end\nfunction _draw() if n > 5 then cls(8) else cls(1) end end`,
+  func: `function add(a,b) return a+b end\nfunction _update() local z=add(1,2) end\nfunction _draw() end`,
+  color: `function _draw() cls(1) rectfill(0,0,10,10,8) end`,
+};
+
+for (const target of ["gametank", "gba", "md"]) {
+  const opts = { target, sdkName: "luacretro", builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE };
+  for (const [name, src] of Object.entries(CORPUS)) {
+    test(`${name} compiles for ${target}`, () => {
+      const r = compile(src, `${name}.lua`, opts);
+      assert.ok(r.ok, "compile failed:\n" + (r.diagnostics || []).map(d => d.message).join("\n"));
+      assert.ok(r.c.includes("main("), "should emit a main()");
+    });
+  }
+}
+
+// Target seams fire distinctly.
+test("gametank bakes color; gba/md pass raw", () => {
+  const src = `function _draw() cls(1) end`;
+  const gt = compile(src, "t.lua", { target: "gametank", builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE });
+  const gba = compile(src, "t.lua", { target: "gba", builtins: CORE, callbacks: CALLBACKS });
+  assert.match(gt.c, /gt_p8_cls\(169\)/);   // P8 index 1 -> CAPTURE 169
+  assert.match(gba.c, /gba_cls\(1\)/);       // raw index
+});
+
+test("md harness is main(bool hard) + md_ includes", () => {
+  const r = compile(`function _draw() cls(1) end`, "t.lua", { target: "md", builtins: CORE, callbacks: CALLBACKS });
+  assert.match(r.c, /int main\(bool hard\)/);
+  assert.match(r.c, /#include "md_api.h"/);
+  assert.match(r.c, /md_cls/);
+});
+
+test("sdkName threads into diagnostics", () => {
+  // assigning an undeclared global inside a function -> the sdkName message
+  const r = compile(`function _update() y = 5 end\nfunction _draw() end`, "t.lua",
+    { target: "gba", sdkName: "gbalua", builtins: CORE, callbacks: CALLBACKS });
+  assert.ok(!r.ok);
+  assert.match(r.diagnostics.map(d => d.message).join("\n"), /gbalua has no implicit globals/);
+});
