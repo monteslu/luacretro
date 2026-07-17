@@ -379,7 +379,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     // newleste's profile showed 18% of the frame in incsp2 stack cleanup
     // from exactly these calls
     const zpKindOk = (k) => k === "int" || (N8 && k === "fixed");
-    if (fn.params.length >= 1 && fn.params.length <= 5 &&
+    if (!isMd && fn.params.length >= 1 && fn.params.length <= 5 &&
         fn.params.every((_, i) => zpKindOk(fn.paramKinds[i] ?? "int")) &&
         (!fn.hasReturnValue || fn.retKind === "int" || (N8 && fn.retKind === "fixed"))) {
       zpCall.add(name);
