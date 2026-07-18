@@ -5,7 +5,10 @@
 The shared Lua compiler front-end for the **gtlua** (GameTank / 6502),
 **gbalua** (Game Boy Advance / ARM), **mdlua** (Sega Genesis / 68000),
 **neslua** (NES / 6502), and **c64lua** (Commodore 64 / 6510) console SDKs.
-A PICO-8-flavored, statically-typed Lua subset compiled to C.
+A PICO-8-flavored, statically-typed Lua subset that is **ahead-of-time compiled
+to C** (then to a native ROM by each SDK) - there is no Lua interpreter or VM on
+the console, just native machine code. The static subset (no heap, no closures,
+fixed-point numbers) is what makes that whole-program AOT compilation possible.
 
 Each SDK depends on luacretro and calls `compile(source, file, opts)` with its
 platform target and its builtin tables:
