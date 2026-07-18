@@ -258,15 +258,77 @@ function touchesFixedRuntime(node) {
   return false;
 }
 
+// Emit the PICO-8 frame harness from the SDK-supplied descriptor. luacretro
+// owns the LOOP SHAPE only; every symbol name is data in `h`. Fields:
+//   signature   the main() signature line ("void main(void)" | "int main(void)"
+//               | "int main(bool hard)")
+//   voidArg     an optional first-statement line (e.g. "(void)hard;")
+//   oddDeclFirst if true, the 30fps odd-frame counter decl is emitted BEFORE
+//               init (cc65 C89) instead of after
+//   oddVar      the odd-frame counter variable name (for fps30Style "oddCounter")
+//   init        ordered unconditional init call names (no parens/semicolon)
+//   onAudio/onMusic/onFps30  call names emitted when usesAudio / usesMusic /
+//               (thirty && runtime-paced); null to skip
+//   loopTop     ordered per-frame prelude call names
+//   frameEnd    the end-of-frame call name
+//   fps30Style  "runtime" (unconditional _update every loop; the runtime paces)
+//               or "oddCounter" (inline every-other-frame gate via oddVar)
+//   returns     whether to emit "return 0;" before the closing brace
+function emitHarness(out, h, ctx) {
+  const { has, callCb, thirty, usesAudio, usesMusic } = ctx;
+  out.push(h.signature);
+  out.push("{");
+  if (h.voidArg) out.push(`    ${h.voidArg}`);
+  const oddDecl = () => { if (thirty && h.fps30Style === "oddCounter") out.push(`    unsigned char ${h.oddVar} = 0;`); };
+  if (h.oddDeclFirst) oddDecl();
+  for (const fn of h.init) out.push(`    ${fn}();`);
+  if (usesAudio && h.onAudio) out.push(`    ${h.onAudio}();`);
+  if (usesMusic && h.onMusic) out.push(`    ${h.onMusic}();`);
+  if (thirty && h.onFps30) out.push(`    ${h.onFps30}();`);
+  if (has("_init")) callCb("_init", "    ");
+  if (!h.oddDeclFirst) oddDecl();
+  out.push("    for (;;) {");
+  for (const fn of h.loopTop) out.push(`        ${fn}();`);
+  if (has("_update60")) callCb("_update60", "        ");
+  if (thirty) {
+    if (h.fps30Style === "oddCounter") {
+      out.push(`        if (${h.oddVar} == 0) {`);
+      callCb("_update", "            ");
+      out.push("        }");
+      out.push(`        ${h.oddVar} ^= 1;`);
+    } else {
+      callCb("_update", "        ");
+    }
+  }
+  if (has("_draw")) callCb("_draw", "        ");
+  out.push(`        ${h.frameEnd}();`);
+  out.push("    }");
+  if (h.returns) out.push("    return 0;");
+  out.push("}");
+  out.push("");
+}
+
+// Normalize the SDK-supplied target descriptor. luacretro holds NO console
+// table: the SDK passes { caps, harness } (see each SDK's compiler/index.js).
+// A bare string is a LEGACY path that resolves through the SDK-agnostic default
+// only; new SDKs must pass the descriptor object.
+function resolveTarget(t) {
+  if (t && typeof t === "object" && t.caps && t.harness) return t;
+  throw new Error(
+    "luacretro: opts.target must be a descriptor object { caps, harness }. " +
+    "The SDK provides it (see compiler/index.js). Bare-string targets are no longer supported.",
+  );
+}
+
 export function emit(chunk, symbols, file, opts = {}) {
   const BUILTINS = opts.builtins || {};
   const CALLBACKS = opts.callbacks || [];
   const GT_MEMBERS = opts.members || null;
   const sdkName = opts.sdkName || "luacretro";
-  // extras namespace name ("gt"/"nes"/"c64"); defaults to "gt" (byte-identical
-  // for the gametank/gba/md front-ends, which never pass memberNs).
+  // extras namespace name (the SDK's member prefix); defaults to "gt". SDKs
+  // with no extras namespace never pass memberNs.
   const NS = opts.memberNs || "gt";
-  // gametank color tooling (SDK-provided; only the gametank target bakes colors)
+  // color-bake tooling (SDK-provided; only colorBake targets bake colors)
   const P8_PALETTE = opts.p8Palette || null;
   const nearestColorByte = opts.nearestColorByte || null;
   // ---- target + capability model (ONE source of truth) ----------------------
@@ -276,8 +338,8 @@ export function emit(chunk, symbols, file, opts = {}) {
   // Capability keys:
   //   zpFastcall  6502 zero-page fastcall ABI for DRAW builtins + camera/btn
   //               inline + the fixed-runtime fa/fb staging (gt_a*/gt_p*). Only
-  //               the 6502 targets (gametank/nes/c64) have a zero page.
-  //   banked      GameTank FLASH2M cross-bank far-call machinery (gametank only
+  //               a zero page (the zpFastcall/fixedZp fast paths use it).
+  //   banked      cross-bank far-call machinery (targets with paged ROM only
   //               in v1; NES/C64 banking is a later milestone).
   //   nativeDiv   the CPU has a hardware integer divide/modulo (gba/md); false
   //               targets go through the gt_ifdiv/gt_ffmod runtime helpers.
@@ -289,31 +351,22 @@ export function emit(chunk, symbols, file, opts = {}) {
   //               (nes) whose SDK enables only the verbs it can honor.
   //   prefix      the final cName remap: "" keeps gt_ names, else gt_p8_*/gt_*
   //               collapse to <prefix>_ (matches the runtime's symbol schema).
-  const CAPS = {
-    gametank: { zpFastcall: true,  banked: true,  nativeDiv: false, colorBake: true,  framebuffer: true,  prefix: "" },
-    gba:      { zpFastcall: false, banked: false, nativeDiv: true,  colorBake: false, framebuffer: true,  prefix: "gba" },
-    md:       { zpFastcall: false, banked: false, nativeDiv: true,  colorBake: false, framebuffer: true,  prefix: "md" },
-    nes:      { zpFastcall: true,  banked: false, nativeDiv: false, colorBake: true,  framebuffer: false, prefix: "nes" },
-    c64:      { zpFastcall: false, banked: false, nativeDiv: false, colorBake: true,  framebuffer: true,  prefix: "c64" },
-  };
-  const target = CAPS[opts.target] ? opts.target
-               : opts.target === "gametank" ? "gametank"
-               : opts.target === "md" ? "md" : "gba";
-  const caps = CAPS[target];
-  const isGba = target === "gba";
-  const isGametank = target === "gametank";
-  const isMd = target === "md";
-  const isNes = target === "nes";
-  const isC64 = target === "c64";
+  // The TARGET DESCRIPTOR is supplied by the SDK (opts.target). luacretro holds
+  // NO table of consoles: caps, the cName prefix, and the frame harness are all
+  // data the SDK passes in. `resolveTarget` normalizes/validates it (and maps a
+  // bare-string legacy value through the SDK-agnostic default only if given).
+  const target = resolveTarget(opts.target);
+  const caps = target.caps;
+  const harness = target.harness;
   // A target's C runtime names everything gt_p8_*/gt_* in the SHARED schema; the
   // per-platform runtime mirrors the same set under its own prefix. Remap at the
   // call site so the builtins table stays single-source (no forked builtins.js).
-  // GameTank keeps the gt_* schema names verbatim (prefix "").
+  // prefix "" keeps the schema names verbatim.
+  const pfx = caps.prefix;
   const cName = (c) => {
-    if (!c || !caps.prefix) return c;
-    return c.replace(/^gt_p8_/, caps.prefix + "_").replace(/^gt_/, caps.prefix + "_");
+    if (!c || !pfx) return c;
+    return c.replace(/^gt_p8_/, pfx + "_").replace(/^gt_/, pfx + "_");
   };
-  // Only the GameTank has a banked (FLASH2M) build in v1.
   const banked = opts.banked === true && caps.banked;
   const placement = opts.placement ?? {};
   const bankOf = (name) => (banked ? (placement[name] ?? "fixed") : "fixed");
@@ -407,11 +460,10 @@ export function emit(chunk, symbols, file, opts = {}) {
     // newleste's profile showed 18% of the frame in incsp2 stack cleanup
     // from exactly these calls
     const zpKindOk = (k) => k === "int" || (N8 && k === "fixed");
-    // gba keeps its historical !isMd zpCall population for byte-identity (a
-    // latent quirk its examples never trigger; RECONCILIATION item 15). c64's
-    // runtime has no zp-user-fn ABI (caps.zpFastcall drives DRAW builtins, but
-    // user fns use real C params on c64), so exclude it explicitly.
-    if (!isMd && !isC64 && fn.params.length >= 1 && fn.params.length <= 5 &&
+    // caps.zpUserFn: the target passes 1-3 int params to leaf user functions
+    // through zero-page slots instead of the C stack. A 6502 zp-ABI perf trick;
+    // targets whose runtime has no zp-user-fn convention set it false.
+    if (caps.zpUserFn && fn.params.length >= 1 && fn.params.length <= 5 &&
         fn.params.every((_, i) => zpKindOk(fn.paramKinds[i] ?? "int")) &&
         (!fn.hasReturnValue || fn.retKind === "int" || (N8 && fn.retKind === "fixed"))) {
       zpCall.add(name);
@@ -728,17 +780,17 @@ export function emit(chunk, symbols, file, opts = {}) {
     // 64-bit intermediate — the ARM7 and 68000 have hardware multiply + divide,
     // so no runtime call and no zero-page staging (the whole gt_fmul/gt_fdiv/
     // fa/fb apparatus is a 6502 workaround better hardware doesn't need). The
-    // 6502 targets (gametank/nes/c64) keep the runtime + zp-staging fast path.
+    // fixedZp targets keep the runtime + zp-staging fast path.
     if (caps.nativeDiv) {
       if (fn === "gt_fmul") return `(long)(((long long)(${L}) * (${R})) >> 16)`;
       if (fn === "gt_fdiv") return `(long)((((long long)(${L})) << 16) / (${R}))`;
       // gt_ffmod handled at its own call site; other fns shouldn't reach here.
       return `${fn}(${L}, ${R})`;
     }
-    // gametank/nes stage operands through fa/fb + the _zp asm entries. c64's
-    // runtime ships the plain cdecl c64_fmul/c64_fdiv (no _zp variant), so it
-    // uses the fall-through cdecl form below.
-    const zpOk = !isC64;
+    // caps.fixedZp: the runtime provides zero-page-staged fixed mul/div entries
+    // (fa/fb + _zp). Targets whose runtime ships only the plain cdecl fmul/fdiv
+    // set it false and use the fall-through form below.
+    const zpOk = caps.fixedZp;
     if (zpOk && !touchesFixedRuntime(left) && !touchesFixedRuntime(right)) {
       return `(fa = ${L}, fb = ${R}, ${fn}_zp())`;
     }
@@ -815,7 +867,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       // is used as-is (a game that computes a 0-15 index will render wrong; the
       // GameTank palette differs from PICO-8's, documented best-effort).
       case "color": {
-        // colorBake targets (gametank/nes/c64): a static 0-15 P8 index bakes to
+        // colorBake targets: a static 0-15 P8 index bakes to
         // its raw platform palette byte at compile time (the runtime takes a raw
         // byte). Framebuffer targets (GBA/Genesis): the runtime palette IS the
         // PICO-8 16, so a color arg passes as its raw index.
@@ -1021,7 +1073,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       const y = expr(e.args[2], "int");
       // GameTank bakes the p8 index -> GT byte here (its resolve_color expects an
       // already-baked byte). GBA passes the raw 0-15 index (argAt's color case is
-      // gated on isGba to skip the bake).
+      // gated on the colorBake cap to skip the bake).
       const c = e.args[3] ? argAt(e, 3, "color") : "-1";
       if (e.printKind === "str") {
         const esc = String(e.args[0].value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -1062,7 +1114,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     // instead of paying cc65's C-stack push per argument. Skipped when an
     // argument expression could itself draw (a user-function call would
     // clobber the slots mid-sequence) - those sites use the cdecl wrapper.
-    // Zero-page fastcall (the 6502 targets gametank/nes/c64): draw builtins
+    // Zero-page fastcall (zpFastcall targets): draw builtins
     // stage their args into gt_a0.. and call the argless _z entry. The
     // hardware-stack targets (GBA/Genesis, no zp) skip the whole ZP-fastcall /
     // camera / btn-inline block: every builtin is a plain gba_*/md_* call from
@@ -1565,10 +1617,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   let currentFn = null;
 
   out.push(`/* generated by ${sdkName} from ${file} - edit the .lua, not this file */`);
-  if (isMd) { out.push(`#include "md_api.h"`); out.push(`#include "md_math.h"`); }
-  else if (isNes) { out.push(`#include "nes_api.h"`); out.push(`#include "nes_math.h"`); }
-  else if (isC64) { out.push(`#include "c64_api.h"`); }
-  else out.push(isGba ? `#include "gba_api.h"` : `#include "gt_api.h"`);
+  for (const inc of harness.includes) out.push(`#include "${inc}"`);
   out.push("");
 
   // banked builds: functions get external linkage (the far-call stubs in
@@ -1793,122 +1842,12 @@ export function emit(chunk, symbols, file, opts = {}) {
     }
     out.push(`${ind}${mangle(name)}();`);
   };
-  if (isMd) {
-    // SGDK harness: md_init brings up the VDP + palette + tiles, then the frame
-    // loop latches input (md_vsync), runs the callbacks, draws, and flushes the
-    // SAT + palette + raster tables at vblank (md_endframe). _update60 runs every
-    // frame (60 Hz); _update runs every OTHER frame (30 Hz, PICO-8's default) so
-    // ports written for 30 fps keep their timing. _draw + endframe are 60 Hz.
-    out.push("int main(bool hard)");
-    out.push("{");
-    out.push("    (void)hard;");
-    out.push("    md_init();");
-    if (has("_init")) callCb("_init", "    ");
-    if (thirty) out.push("    unsigned char _md_odd = 0;");
-    out.push("    for (;;) {");
-    out.push("        md_vsync();");        // latch input, reset sprite list
-    if (has("_update60")) callCb("_update60", "        ");
-    if (thirty) {
-      out.push("        if (_md_odd == 0) {");
-      callCb("_update", "            ");
-      out.push("        }");
-      out.push("        _md_odd ^= 1;");
-    }
-    if (has("_draw")) callCb("_draw", "        ");
-    out.push("        md_endframe();");     // SAT + palette flush, vblank sync
-    out.push("    }");
-    out.push("    return 0;");
-    out.push("}");
-    out.push("");
-  } else if (isGba) {
-    // libtonc harness: install the vblank IRQ (THE #1 GBA footgun — before the
-    // first VBlankIntrWait), let the runtime bring up video, then the frame loop
-    // reads input, runs the callbacks, and flushes OAM at vblank. All the moving
-    // parts (DISPCNT, OAM shadow, input latch, oam flush) live in gba_api.c.
-    out.push("int main(void)");
-    out.push("{");
-    out.push("    gba_init();");
-    if (has("_init")) callCb("_init", "    ");
-    out.push("    for (;;) {");
-    out.push("        gba_vsync();");        // VBlankIntrWait + latch input
-    if (has("_update60")) callCb("_update60", "        ");
-    if (thirty) callCb("_update", "        ");
-    if (has("_draw")) callCb("_draw", "        ");
-    out.push("        gba_endframe();");     // oam flush + housekeeping
-    out.push("    }");
-    out.push("    return 0;");
-    out.push("}");
-    out.push("");
-  } else if (isNes) {
-    // NES harness (cc65). nes_init brings up the PPU + palette + font CHR and
-    // turns rendering on; the frame loop latches input (nes_update_inputs),
-    // clears the shadow-OAM sprite list, runs the callbacks (which stage sprites
-    // + queue nametable writes), then nes_endframe() = OAM-DMA + VRAM-queue drain
-    // at the NEXT vblank (ppu_wait_nmi). The STAGE-then-wait order is baked into
-    // the loop so a user can't hit the #1 NES sprite-flicker footgun (see docs).
-    // _update runs every OTHER frame at 30fps (PICO-8's default); _update60 and
-    // _draw run every frame.
-    out.push("void main(void)");
-    out.push("{");
-    // C89 (cc65): all declarations before statements.
-    if (thirty) out.push("    unsigned char _nes_odd = 0;");
-    out.push("    nes_init();");
-    if (symbols.usesAudio) out.push("    nes_audio_init();");
-    if (has("_init")) callCb("_init", "    ");
-    out.push("    for (;;) {");
-    out.push("        nes_update_inputs();");
-    out.push("        nes_oam_clear();");
-    if (has("_update60")) callCb("_update60", "        ");
-    if (thirty) {
-      out.push("        if (_nes_odd == 0) {");
-      callCb("_update", "            ");
-      out.push("        }");
-      out.push("        _nes_odd ^= 1;");
-    }
-    if (has("_draw")) callCb("_draw", "        ");
-    out.push("        nes_endframe();");
-    out.push("    }");
-    out.push("}");
-    out.push("");
-  } else if (isC64) {
-    // C64 harness (cc65). c64_init brings up the VIC-II bitmap surface + palette;
-    // the frame loop latches input, runs the callbacks (full framebuffer drawing),
-    // and flips at raster (c64_endframe). _update = 30fps, _update60/_draw = 60.
-    out.push("void main(void)");
-    out.push("{");
-    out.push("    c64_init();");
-    if (symbols.usesAudio) out.push("    c64_audio_init();");
-    if (symbols.usesMusic) out.push("    c64_music_init();");
-    if (thirty) out.push("    c64_p8_fps30();");
-    if (has("_init")) callCb("_init", "    ");
-    out.push("    for (;;) {");
-    out.push("        c64_update_inputs();");
-    if (has("_update60")) callCb("_update60", "        ");
-    if (thirty) callCb("_update", "        ");
-    if (has("_draw")) callCb("_draw", "        ");
-    out.push("        c64_endframe();");
-    out.push("    }");
-    out.push("}");
-    out.push("");
-  } else {
-    out.push("void main(void)");
-    out.push("{");
-    out.push("    gt_init();");
-    out.push("    gt_sheet_init();");
-    if (symbols.usesAudio) out.push("    gt_audio_init();");
-    if (symbols.usesMusic) out.push("    gt_music_init();");
-    if (thirty) out.push("    gt_p8_fps30();");
-    if (has("_init")) callCb("_init", "    ");
-    out.push("    for (;;) {");
-    out.push("        gt_update_inputs();");
-    if (has("_update60")) callCb("_update60", "        ");
-    if (thirty) callCb("_update", "        ");
-    if (has("_draw")) callCb("_draw", "        ");
-    out.push("        gt_endframe();");
-    out.push("    }");
-    out.push("}");
-    out.push("");
-  }
+  // The frame harness is DATA the SDK supplies (target.harness) - luacretro
+  // knows the PICO-8 loop SHAPE (init -> for(;;){ per-frame prelude; _update60;
+  // _update@30; _draw; frameEnd }) but not a single console's symbol names.
+  // Every field below is provided by the SDK's target descriptor; see the
+  // HARNESS_SHAPE doc in this package's README for the contract.
+  emitHarness(out, harness, { has, callCb, thirty, usesAudio: symbols.usesAudio, usesMusic: symbols.usesMusic });
 
   // far-call stubs (assembled separately, linked into the FIXED bank).
   // A stub forwards the cc65 fastcall registers blindly: A/X carry the last
@@ -1960,12 +1899,11 @@ export function emit(chunk, symbols, file, opts = {}) {
   if (banked) out.push(`#pragma rodata-name ("B1RODATA")`, "");
 
   let cUnit = out.join("\n");
-  // Prefixed targets (md/nes/c64) get a whole-unit gt_*→<prefix>_ collapse: it
-  // cleans up the special-form emissions (gt_mret_*, the gt_a*/gt_p* zp slots,
-  // gt_fmul_zp, ...) that bypass per-call cName. The framebuffer md target and
-  // the 6502 nes/c64 targets all rename to their own runtime schema. gametank
-  // keeps gt_* (prefix ""); gba's per-call cName is already complete.
-  if (caps.prefix && (isMd || isNes || isC64)) {
+  // caps.finalRename: a whole-unit gt_*→<prefix>_ collapse that cleans up the
+  // special-form emissions (mret_*, the a*/p* zp slots, fmul_zp, ...) which
+  // bypass per-call cName. Targets whose per-call cName already covers every
+  // emission (or that keep the raw schema, prefix "") set it false.
+  if (caps.prefix && caps.finalRename) {
     const p = caps.prefix + "_";
     cUnit = cUnit.replace(/\bgt_p8_/g, p).replace(/\bgt_/g, p);
   }

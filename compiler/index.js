@@ -19,11 +19,12 @@ import { emit } from "./emit.js";
  * @param {string} source
  * @param {string} file  name used in diagnostics
  * @param {object} [opts]
- *   - target: "gametank" | "gba" | "md"  (selects codegen)
- *   - sdkName: "gtlua" | "gbalua" | "mdlua"  (diagnostic + generated-by text)
+ *   - target: the SDK's target descriptor { caps, harness } - luacretro holds
+ *     NO console table; each SDK supplies how its C runtime is named + shaped.
+ *   - sdkName: the SDK's name (diagnostic + generated-by text)
  *   - builtins, members, callbacks: the SDK's merged tables
- *   - p8Palette, nearestColorByte: GameTank color tooling (gametank only)
- *   - banked, placement, num8, inliner: GameTank build knobs (passthrough)
+ *   - p8Palette, nearestColorByte: color-bake tooling (colorBake targets only)
+ *   - banked, placement, num8, inliner: build knobs (passthrough)
  * @returns {{ok, c, diagnostics, callGraph?, stubs?}}
  */
 export function compile(source, file = "main.lua", opts = {}) {

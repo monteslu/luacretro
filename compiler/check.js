@@ -18,8 +18,8 @@ export function check(chunk, file, opts = {}) {
   const CALLBACKS = opts.callbacks || [];
   const GT_MEMBERS = opts.members || null;  // the platform-extras namespace table
   const sdkName = opts.sdkName || "luacretro";
-  // The extras namespace object name: "gt" for gametank, "nes"/"c64" for those.
-  // Defaults to "gt" so the gametank/gba/md front-ends are byte-identical.
+  // The extras namespace object name (the SDK's member prefix). Defaults to
+  // "gt" for SDKs that never pass memberNs (byte-identical).
   const NS = opts.memberNs || "gt";
   // Per-target static-allocation caps. An SDK whose RAM is tighter (NES: 8KB
   // PRG-RAM; C64: full RAM) passes its own ceilings via opts.limits; the
@@ -703,7 +703,7 @@ export function check(chunk, file, opts = {}) {
     function callType(call, asStatement = false) {
       const callee = call.callee;
 
-      // gt.* namespace: gametank exposes engine verbs here (the SDK passes a
+      // extras namespace: an SDK may expose engine verbs here (it passes a
       // GT_MEMBERS table). On gba/md there is no such escape hatch - reject it.
       if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === NS) {
         if (!GT_MEMBERS) {
