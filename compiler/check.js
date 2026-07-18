@@ -16,8 +16,11 @@ const join = (a, b) => (a === "fixed" || b === "fixed") ? "fixed" : "int";
 export function check(chunk, file, opts = {}) {
   const BUILTINS = opts.builtins || {};
   const CALLBACKS = opts.callbacks || [];
-  const GT_MEMBERS = opts.members || null;  // gt.* namespace: gametank only
+  const GT_MEMBERS = opts.members || null;  // the platform-extras namespace table
   const sdkName = opts.sdkName || "luacretro";
+  // The extras namespace object name: "gt" for gametank, "nes"/"c64" for those.
+  // Defaults to "gt" so the gametank/gba/md front-ends are byte-identical.
+  const NS = opts.memberNs || "gt";
   // Per-target static-allocation caps. An SDK whose RAM is tighter (NES: 8KB
   // PRG-RAM; C64: full RAM) passes its own ceilings via opts.limits; the
   // defaults preserve the historical gtlua/gbalua/mdlua numbers exactly (so
@@ -702,13 +705,13 @@ export function check(chunk, file, opts = {}) {
 
       // gt.* namespace: gametank exposes engine verbs here (the SDK passes a
       // GT_MEMBERS table). On gba/md there is no such escape hatch - reject it.
-      if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === "gt") {
+      if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === NS) {
         if (!GT_MEMBERS) {
-          err(call, `'gt.${callee.field}' is a GameTank-only verb and isn't available on this platform - use the platform's verbs instead (see docs/CHEATSHEET.md)`);
+          err(call, `'${NS}.${callee.field}' is a GameTank-only verb and isn't available on this platform - use the platform's verbs instead (see docs/CHEATSHEET.md)`);
           return "int";
         }
         const sig = GT_MEMBERS[callee.field];
-        if (!sig) { err(call, `unknown gt function 'gt.${callee.field}'`); return "int"; }
+        if (!sig) { err(call, `unknown ${NS} function '${NS}.${callee.field}'`); return "int"; }
         if (sig.audio) usesAudio.flag = true;
         // gt.rgb has two forms: gt.rgb(byte) raw, or gt.rgb(r,g,b) resolved to
         // the nearest palette byte at compile time (r,g,b must be constants).
@@ -721,7 +724,7 @@ export function check(chunk, file, opts = {}) {
           call.sig = sig;
           return sig.ret;
         }
-        checkArgs(call, sig.params, `gt.${callee.field}`);
+        checkArgs(call, sig.params, `${NS}.${callee.field}`);
         call.sig = sig;
         return sig.ret;
       }
@@ -853,7 +856,7 @@ export function check(chunk, file, opts = {}) {
           if (!sym || sym.kind !== "pool") {
             err(a, `${name}() argument ${i + 1} must be a pool`);
           } else {
-            const bare = name.startsWith("gt.") ? name.slice(3) : name;
+            const bare = name.includes(".") ? name.slice(name.indexOf(".") + 1) : name;
             if (bare === "parts_step") {
               for (const f of ["x", "y", "vx", "vy"]) {
                 const fl = sym.fields.get(f);
@@ -932,8 +935,8 @@ export function check(chunk, file, opts = {}) {
               err(e, `'${e.name}' is a function - functions are not values in ${sdkName} (no closures); call it`);
             } else if (BUILTINS[e.name]) {
               err(e, `'${e.name}' is a builtin function - call it: ${e.name}(...)`);
-            } else if (e.name === "gt") {
-              err(e, "'gt' is the hardware module; use gt.<function>(...)");
+            } else if (e.name === NS) {
+              err(e, `'${NS}' is the hardware module; use ${NS}.<function>(...)`);
             } else {
               err(e, `'${e.name}' is not declared`);
             }
@@ -943,13 +946,13 @@ export function check(chunk, file, opts = {}) {
           return symKind(sym);
         }
         case "member": {
-          if (e.object.kind === "name" && e.object.name === "gt") {
+          if (e.object.kind === "name" && e.object.name === NS) {
             if (GT_MEMBERS) {
-              if (GT_MEMBERS[e.field]) { err(e, `gt.${e.field} must be called: gt.${e.field}(...)`); return "int"; }
-              err(e, `unknown gt member 'gt.${e.field}'`);
+              if (GT_MEMBERS[e.field]) { err(e, `${NS}.${e.field} must be called: ${NS}.${e.field}(...)`); return "int"; }
+              err(e, `unknown ${NS} member '${NS}.${e.field}'`);
               return "int";
             }
-            err(e, `'gt.${e.field}' is a GameTank-only verb and isn't available on this platform (see docs/CHEATSHEET.md)`);
+            err(e, `'${NS}.${e.field}' is a GameTank-only verb and isn't available on this platform (see docs/CHEATSHEET.md)`);
             return "int";
           }
           if (e.object.kind === "name") {

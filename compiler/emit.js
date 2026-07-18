@@ -263,6 +263,9 @@ export function emit(chunk, symbols, file, opts = {}) {
   const CALLBACKS = opts.callbacks || [];
   const GT_MEMBERS = opts.members || null;
   const sdkName = opts.sdkName || "luacretro";
+  // extras namespace name ("gt"/"nes"/"c64"); defaults to "gt" (byte-identical
+  // for the gametank/gba/md front-ends, which never pass memberNs).
+  const NS = opts.memberNs || "gt";
   // gametank color tooling (SDK-provided; only the gametank target bakes colors)
   const P8_PALETTE = opts.p8Palette || null;
   const nearestColorByte = opts.nearestColorByte || null;
@@ -835,13 +838,12 @@ export function emit(chunk, symbols, file, opts = {}) {
   function call(e) {
     const callee = e.callee;
 
-    // gt.* extras (gametank only)
-    if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === "gt") {
-      // gt.* is a GameTank-only namespace (the SDK passes a GT_MEMBERS table);
-      // on gba/md there is no such escape hatch.
-      if (!isGametank || !GT_MEMBERS) {
+    // platform-extras namespace (gt.* / nes.* / c64.*): any target whose SDK
+    // passes a members table has one; gba/md do not.
+    if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === NS) {
+      if (!GT_MEMBERS) {
         throw new Error(
-          `'gt.${callee.field}' is a GameTank-only verb and isn't available on this platform - ` +
+          `'${NS}.${callee.field}' is a GameTank-only verb and isn't available on this platform - ` +
           `use the platform's verbs instead (see docs/CHEATSHEET.md).`,
         );
       }
@@ -1841,9 +1843,10 @@ export function emit(chunk, symbols, file, opts = {}) {
     // _draw run every frame.
     out.push("void main(void)");
     out.push("{");
+    // C89 (cc65): all declarations before statements.
+    if (thirty) out.push("    unsigned char _nes_odd = 0;");
     out.push("    nes_init();");
     if (symbols.usesAudio) out.push("    nes_audio_init();");
-    if (thirty) out.push("    unsigned char _nes_odd = 0;");
     if (has("_init")) callCb("_init", "    ");
     out.push("    for (;;) {");
     out.push("        nes_update_inputs();");
@@ -1866,9 +1869,10 @@ export function emit(chunk, symbols, file, opts = {}) {
     // and flips at raster (c64_endframe). _update = 30fps, _update60/_draw = 60.
     out.push("void main(void)");
     out.push("{");
+    // C89 (cc65): all declarations before statements.
+    if (thirty) out.push("    unsigned char _c64_odd = 0;");
     out.push("    c64_init();");
     if (symbols.usesAudio) out.push("    c64_audio_init();");
-    if (thirty) out.push("    unsigned char _c64_odd = 0;");
     if (has("_init")) callCb("_init", "    ");
     out.push("    for (;;) {");
     out.push("        c64_update_inputs();");
