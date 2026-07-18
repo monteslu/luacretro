@@ -26,5 +26,44 @@
   ],
   "scripts": {
     "test": "node --test 'test/**/*.test.js'"
+  },
+  "keywords": [
+    "lua",
+    "pico-8",
+    "pico8",
+    "gamedev",
+    "game-development",
+    "retro",
+    "retrogaming",
+    "homebrew",
+    "rom",
+    "wasm",
+    "webassembly",
+    "ahead-of-time",
+    "aot",
+    "compiler",
+    "lua-to-c",
+    "transpiler",
+    "console",
+    "sdk",
+    "6502",
+    "68000",
+    "arm",
+    "cc65",
+    "gametank",
+    "gba",
+    "game-boy-advance",
+    "genesis",
+    "nes",
+    "c64",
+    "commodore-64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monteslu/luacretro.git"
+  },
+  "homepage": "https://github.com/monteslu/luacretro#readme",
+  "bugs": {
+    "url": "https://github.com/monteslu/luacretro/issues"
   }
 }
