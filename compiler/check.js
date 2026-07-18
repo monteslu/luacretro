@@ -16,7 +16,7 @@ const join = (a, b) => (a === "fixed" || b === "fixed") ? "fixed" : "int";
 export function check(chunk, file, opts = {}) {
   const BUILTINS = opts.builtins || {};
   const CALLBACKS = opts.callbacks || [];
-  const GT_MEMBERS = opts.members || null;  // the platform-extras namespace table
+  const MEMBERS = opts.members || null;  // the platform-extras namespace table
   const sdkName = opts.sdkName || "luacretro";
   // The extras namespace object name (the SDK's member prefix). Defaults to
   // "gt" for SDKs that never pass memberNs (byte-identical).
@@ -33,7 +33,7 @@ export function check(chunk, file, opts = {}) {
   const diagnostics = [];
   const globals = new Map();   // name -> {kind, fixedInit, node}
   const usesAudio = { flag: false };
-  const usesMusic = { flag: false };   // sfx()/music() -> link gt_music.o
+  const usesMusic = { flag: false };   // sfx()/music() -> link lc_music.o
   const functions = new Map(); // name -> {params:[names], paramKinds:[], ret, retKind, node}
   let reporting = true;        // pass 1 runs once: report; fixpoint passes: quiet
   let changed = false;         // fixpoint tracker
@@ -99,7 +99,7 @@ export function check(chunk, file, opts = {}) {
           }
           // pool(n, "f1,f2,...") - the listed fields are DECLARED byte-wide
           // (values 0-255, stored in one byte, ~2-3x faster per access on
-          // the 65C02). Explicit like array8: the compiler trusts the list
+          // the target 6502). Explicit like array8: the compiler trusts the list
           // and errors only if a listed field turns out fixed-typed.
           const byteFields = new Set();
           if (init.args[1]) {
@@ -124,7 +124,7 @@ export function check(chunk, file, opts = {}) {
         // fixed-capacity array: local pool = array(N [, initValue]).
         // array8(N [, init]) is the byte variant: elements are 0-255 stored in
         // ONE byte each - half the RAM and roughly half the cycles per access
-        // on the 65C02 (single-register load, no high-byte traffic). Values
+        // on the target 6502 (single-register load, no high-byte traffic). Values
         // read back as ordinary ints; stores must be integers (flr() first).
         if (init && init.kind === "call" && init.callee.kind === "name" &&
             init.callee.name === "hexdata") {
@@ -704,21 +704,21 @@ export function check(chunk, file, opts = {}) {
       const callee = call.callee;
 
       // extras namespace: an SDK may expose engine verbs here (it passes a
-      // GT_MEMBERS table). On gba/md there is no such escape hatch - reject it.
+      // MEMBERS table). On gba/md there is no such escape hatch - reject it.
       if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === NS) {
-        if (!GT_MEMBERS) {
-          err(call, `'${NS}.${callee.field}' is a GameTank-only verb and isn't available on this platform - use the platform's verbs instead (see docs/CHEATSHEET.md)`);
+        if (!MEMBERS) {
+          err(call, `'${NS}.${callee.field}' is an engine-extras verb and isn't available on this platform - use the platform's verbs instead (see docs/CHEATSHEET.md)`);
           return "int";
         }
-        const sig = GT_MEMBERS[callee.field];
+        const sig = MEMBERS[callee.field];
         if (!sig) { err(call, `unknown ${NS} function '${NS}.${callee.field}'`); return "int"; }
         if (sig.audio) usesAudio.flag = true;
-        // gt.rgb has two forms: gt.rgb(byte) raw, or gt.rgb(r,g,b) resolved to
+        // <NS>.rgb has two forms: <NS>.rgb(byte) raw, or <NS>.rgb(r,g,b) resolved to
         // the nearest palette byte at compile time (r,g,b must be constants).
         if (callee.field === "rgb" && call.args.length === 3) {
           for (const a of call.args) {
             if (constEval(a) === null) {
-              err(a, "gt.rgb(r, g, b) needs constant 0-255 values (use gt.rgb(byte) for a runtime color)");
+              err(a, `${NS}.rgb(r, g, b) needs constant 0-255 values (use ${NS}.rgb(byte) for a runtime color)`);
             } else typeOf(a);
           }
           call.sig = sig;
@@ -884,8 +884,9 @@ export function check(chunk, file, opts = {}) {
         // a "fn" param is a CALLBACK: a bare reference to a top-level function.
         // Flat ROM makes an indirect call safe (no bank to unmap), and the call
         // graph stays complete because the reference is static. The emitter
-        // renders it as &gtl_<name>. This is what unlocks SGDK's callback API
-        // (task.h, SYS_setVIntCallback, sprite frame-change hooks, ...).
+        // renders it as &lcl_<name>. This is what unlocks a callback-based C SDK's
+        // callback API (task hooks, vertical-interrupt callbacks, sprite
+        // frame-change hooks, ...).
         if (params[i] && params[i][0] === "fn") {
           if (a.kind !== "name" || !functions.has(a.name)) {
             err(a, `${name}() argument ${i + 1} must be a top-level function name (a callback)`);
@@ -947,12 +948,12 @@ export function check(chunk, file, opts = {}) {
         }
         case "member": {
           if (e.object.kind === "name" && e.object.name === NS) {
-            if (GT_MEMBERS) {
-              if (GT_MEMBERS[e.field]) { err(e, `${NS}.${e.field} must be called: ${NS}.${e.field}(...)`); return "int"; }
+            if (MEMBERS) {
+              if (MEMBERS[e.field]) { err(e, `${NS}.${e.field} must be called: ${NS}.${e.field}(...)`); return "int"; }
               err(e, `unknown ${NS} member '${NS}.${e.field}'`);
               return "int";
             }
-            err(e, `'${NS}.${e.field}' is a GameTank-only verb and isn't available on this platform (see docs/CHEATSHEET.md)`);
+            err(e, `'${NS}.${e.field}' is an engine-extras verb and isn't available on this platform (see docs/CHEATSHEET.md)`);
             return "int";
           }
           if (e.object.kind === "name") {

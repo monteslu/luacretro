@@ -1,8 +1,8 @@
-// luacretro peephole - 6502/cc65 .s rewriter (tail-call fusion, redundant
-// reload elimination). Only the GameTank build pipeline calls it.
+// luacretro peephole - 6502 .s rewriter (tail-call fusion, redundant
+// reload elimination). Used by targets whose SDK runs a peephole pass.
 //
-// cc65's own optimizer (-Osr) leaves classic slack on the table; this pass
-// runs between cc65 and ca65 on EVERY compiled C unit (game code and the SDK
+// the 6502 C toolchain's own optimizer leaves classic slack on the table;
+// this pass runs between compile and assemble on EVERY compiled C unit (game code and the SDK
 // alike), so wins apply to all carts with zero source changes. Rules are
 // deliberately conservative: each one preserves machine state exactly, or
 // only discards flag effects it can prove nothing consumes.
@@ -33,14 +33,14 @@ const FLAG_NEUTRAL = new Set(["sta", "stx", "sty"]);
 const FLAG_CONSUMERS_PREFIX = ["b"]; // bcc/bcs/beq/bne/bmi/bpl/bvc/bvs (+bra: reads none, but keep simple)
 
 function parseLine(line) {
-  // instruction lines in cc65 output are TAB-indented: "\tlda     _gtl_px"
+  // instruction lines in the 6502 asm output are TAB-indented: "\tlda     _lcl_px"
   const m = line.match(/^\t([a-z]{3})(?:\s+(.*?))?\s*$/);
   if (!m) return null;
   return { op: m[1], operand: (m[2] ?? "").trim() };
 }
 
 function isLabelOrDirective(line) {
-  // labels ("L0023:", "@rej:", "_gtl_foo:") and directives (".segment", ...)
+  // labels ("L0023:", "@rej:", "_lcl_foo:") and directives (".segment", ...)
   return /^[^\s;]/.test(line) || /^\s*\./.test(line);
 }
 
@@ -90,7 +90,7 @@ export function peephole(text) {
     if (!ok || j >= lines.length) continue;
     const ldaIdx = j;
     // flags-dead scan: from after the lda, must reach an NZ writer or a
-    // jsr/rts (cc65 never carries flags across calls) before any branch,
+    // jsr/rts (the C toolchain never carries flags across calls) before any branch,
     // flag consumer, label, or anything unrecognized.
     let k = ldaIdx + 1, dead = false;
     while (k < lines.length) {

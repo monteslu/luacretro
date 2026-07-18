@@ -1,18 +1,18 @@
-// luacretro C emitter - lowers the checked AST to C for GameTank (cc65),
-// GBA (arm-gcc), or Genesis (m68k-gcc). Shared front-end for the 3 Lua SDKs.
+// luacretro C emitter - lowers the checked AST to C for a console target.
+// Shared front-end for the Lua SDKs.
 //
 // Numeric kinds map to C types: int -> `int` (16-bit), fixed -> `long`
 // (32-bit 16.16). Conversions are explicit and single-evaluation:
 //   promote int->fixed:  ((long)(x) << 16)
 //   floor  fixed->int:   (int)((x) >> 16)     (arithmetic shift = flr)
-// Fixed multiply/divide/mod go through the gt_f* runtime; power-of-two
+// Fixed multiply/divide/mod go through the lc_f* runtime; power-of-two
 // divisors fold to shifts/masks at compile time (exact for 16.16).
 
 
 // Split an index expression into (base, constant offset): `x + 3` -> [x, 3],
 // `x - 2` -> [x, -2], `5` -> [null, 5], anything else -> [expr, 0]. Lets the
 // 1-based array fold collapse the ubiquitous arr[x + 1] to a plain arr[x]
-// instead of runtime arithmetic (cc65 folds symbol+const at link time).
+// instead of runtime arithmetic (the target C toolchain folds symbol+const at link time).
 function peelIndex(e) {
   if (e.kind === "number" && Number.isInteger(e.value)) return [null, Math.trunc(e.value)];
   if (e.kind === "binop" && (e.op === "+" || e.op === "-") &&
@@ -61,7 +61,7 @@ function purelyDup(e, budget = 4) {
 }
 
 // constant-fold a numeric node (literals + neg/binops over literals). Used for
-// gt.rgb(r,g,b), whose args the checker already proved constant.
+// <NS>.rgb(r,g,b), whose args the checker already proved constant.
 function constFold(e) {
   if (!e) return null;
   if (e.kind === "number") return e.value;
@@ -118,19 +118,19 @@ const BANK_SEGMENTS = {
 };
 const BANK_NUMBER = { b0: 0, b1: 1, b2: 2, b4: 4, b5: 5 };
 
-// Draw builtins with a zero-page fastcall entry point (sdk/gt_blitq.s owns
-// the gt_a* slots; gt_api.h declares the _z functions).
+// Draw builtins with a zero-page fastcall entry point (sdk/lc_blitq.s owns
+// the lc_a* slots; lc_api.h declares the _z functions).
 const ZP_BUILTINS = {
-  pset: "gt_p8_pset_z", rectfill: "gt_p8_rectfill_z", rect: "gt_p8_rect_z",
-  circfill: "gt_p8_circfill_z", circ: "gt_p8_circ_z", line: "gt_p8_line_z",
-  spr: "gt_p8_spr_z", sset: "gt_p8_sset_z",
+  pset: "lc_pset_z", rectfill: "lc_rectfill_z", rect: "lc_rect_z",
+  circfill: "lc_circfill_z", circ: "lc_circ_z", line: "lc_line_z",
+  spr: "lc_spr_z", sset: "lc_sset_z",
 };
 
-// P8 button index -> pad-word mask (mirror of btn_mask[] in gt_api.c)
+// P8 button index -> pad-word mask (mirror of btn_mask[] in lc_api.c)
 const BTN_MASKS = [512, 256, 2056, 1028, 16, 4096, 8192, 32];
 
 // Does this expression contain a user-function call? One could draw, which
-// would clobber the gt_a* slots mid-store-sequence - such call sites fall
+// would clobber the lc_a* slots mid-store-sequence - such call sites fall
 // back to the cdecl wrappers. (Annotation keys skipped: they cycle.)
 function hasUserCall(node) {
   if (!node || typeof node !== "object") return false;
@@ -233,9 +233,9 @@ function assignsTo(node, name) {
 // the argless entry, so an operand that ITSELF reaches the fixed runtime would
 // clobber fa/fb between the stage and the call and corrupt the result. This is
 // deliberately conservative: not just literal fixed `*`/`/`, but `%`/`\`
-// (which lower to gt_ffmod/gt_fdiv), AND any fixed-typed call (sqrt/atan2/rnd
-// transitively call gt_fmul/gt_fdiv; the cdecl wrappers write fa/fb too). Such
-// sites fall back to the cdecl gt_fmul/gt_fdiv, which is always correct - the
+// (which lower to lc_ffmod/lc_fdiv), AND any fixed-typed call (sqrt/atan2/rnd
+// transitively call lc_fmul/lc_fdiv; the cdecl wrappers write fa/fb too). Such
+// sites fall back to the cdecl lc_fmul/lc_fdiv, which is always correct - the
 // fallback is rare, so the conservatism is nearly free. (If a genuinely pure
 // fixed builtin is ever added, it can be whitelisted here.)
 function touchesFixedRuntime(node) {
@@ -245,11 +245,11 @@ function touchesFixedRuntime(node) {
     if (node.op === "*" && node.tk === "fixed"
         && node.left.tk !== "int" && node.right.tk !== "int") return true;
     if ((node.op === "/" || node.op === "\\" || node.op === "%") && !node.divConst) {
-      // fixed operands -> gt_fdiv/gt_ffmod; int `\`/`%` stay native (no fa/fb)
+      // fixed operands -> lc_fdiv/lc_ffmod; int `\`/`%` stay native (no fa/fb)
       if (node.op === "/" || node.tk === "fixed" || node.operandKind === "fixed") return true;
     }
   }
-  // any call producing a fixed value may reach gt_fmul/gt_fdiv internally
+  // any call producing a fixed value may reach lc_fmul/lc_fdiv internally
   if (node.kind === "call" && node.tk === "fixed") return true;
   for (const [k, v] of Object.entries(node)) {
     if (WALK_SKIP.has(k)) continue;
@@ -264,7 +264,7 @@ function touchesFixedRuntime(node) {
 //               | "int main(bool hard)")
 //   voidArg     an optional first-statement line (e.g. "(void)hard;")
 //   oddDeclFirst if true, the 30fps odd-frame counter decl is emitted BEFORE
-//               init (cc65 C89) instead of after
+//               init (target C89 toolchain) instead of after
 //   oddVar      the odd-frame counter variable name (for fps30Style "oddCounter")
 //   init        ordered unconditional init call names (no parens/semicolon)
 //   onAudio/onMusic/onFps30  call names emitted when usesAudio / usesMusic /
@@ -323,7 +323,7 @@ function resolveTarget(t) {
 export function emit(chunk, symbols, file, opts = {}) {
   const BUILTINS = opts.builtins || {};
   const CALLBACKS = opts.callbacks || [];
-  const GT_MEMBERS = opts.members || null;
+  const MEMBERS = opts.members || null;
   const sdkName = opts.sdkName || "luacretro";
   // extras namespace name (the SDK's member prefix); defaults to "gt". SDKs
   // with no extras namespace never pass memberNs.
@@ -337,19 +337,19 @@ export function emit(chunk, symbols, file, opts = {}) {
   //
   // Capability keys:
   //   zpFastcall  6502 zero-page fastcall ABI for DRAW builtins + camera/btn
-  //               inline + the fixed-runtime fa/fb staging (gt_a*/gt_p*). Only
+  //               inline + the fixed-runtime fa/fb staging (lc_a*/lc_p*). Only
   //               a zero page (the zpFastcall/fixedZp fast paths use it).
   //   banked      cross-bank far-call machinery (targets with paged ROM only
   //               in v1; NES/C64 banking is a later milestone).
   //   nativeDiv   the CPU has a hardware integer divide/modulo (gba/md); false
-  //               targets go through the gt_ifdiv/gt_ffmod runtime helpers.
+  //               targets go through the lc_ifdiv/lc_ffmod runtime helpers.
   //   colorBake   a static P8 color literal 0-15 is baked to a raw platform
   //               palette byte at compile time (needs opts.p8Palette). The
   //               framebuffer targets (gba/md) pass the raw index instead.
   //   framebuffer the platform has a full pixel surface (gba/md/c64), so every
   //               P8 drawing verb lands somewhere. false = a tile/sprite machine
   //               (nes) whose SDK enables only the verbs it can honor.
-  //   prefix      the final cName remap: "" keeps gt_ names, else gt_p8_*/gt_*
+  //   prefix      the final cName remap: "" keeps lc_ names, else lc_*/lc_*
   //               collapse to <prefix>_ (matches the runtime's symbol schema).
   // The TARGET DESCRIPTOR is supplied by the SDK (opts.target). luacretro holds
   // NO table of consoles: caps, the cName prefix, and the frame harness are all
@@ -358,14 +358,14 @@ export function emit(chunk, symbols, file, opts = {}) {
   const target = resolveTarget(opts.target);
   const caps = target.caps;
   const harness = target.harness;
-  // A target's C runtime names everything gt_p8_*/gt_* in the SHARED schema; the
+  // A target's C runtime names everything lc_*/lc_* in the SHARED schema; the
   // per-platform runtime mirrors the same set under its own prefix. Remap at the
   // call site so the builtins table stays single-source (no forked builtins.js).
   // prefix "" keeps the schema names verbatim.
   const pfx = caps.prefix;
   const cName = (c) => {
     if (!c || !pfx) return c;
-    return c.replace(/^gt_p8_/, pfx + "_").replace(/^gt_/, pfx + "_");
+    return c.replace(/^lc_/, pfx + "_");
   };
   const banked = opts.banked === true && caps.banked;
   const placement = opts.placement ?? {};
@@ -386,7 +386,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (node.kind === "function") return false;
     return Object.values(node).some((v) => typeof v === "object" && v !== null && hasReturn(v, seen));
   };
-  let zpParamMap = null;          // leaf zp-fastcall fns: param -> gt_pN
+  let zpParamMap = null;          // leaf zp-fastcall fns: param -> lc_pN
   const inlineStack = new Set();  // fns currently being inlined (recursion guard)
   const declaredCache = new Map(); // fn name -> Set of names declared inside it
   const freeCache = new Map();     // fn name -> Set of free (outer) names it uses
@@ -429,7 +429,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   const nilSent = (kind) => (kind === "fixed" ? NIL_SENT_FIXED : NIL_SENT_INT);
   const stubbed = new Set(); // callee names reached through a far-call stub
   const line = (s) => out.push("    ".repeat(s === "" ? 0 : indent) + s);
-  const mangle = (name) => `gtl_${name}`;
+  const mangle = (name) => `lcl_${name}`;
   const { globals, functions } = symbols;
 
   // user-function call graph (also returned for the CLI's bank solver)
@@ -439,9 +439,9 @@ export function emit(chunk, symbols, file, opts = {}) {
   }
 
   // ---- zp-fastcall for user functions ---------------------------------------
-  // Functions with 1-3 all-int params take them in the gt_p0..2 zero-page
-  // slots (the ABI that makes the draw builtins cheap) instead of cc65's
-  // C-stack convention. LEAF fns (no user calls in the body) read the slots
+  // Functions with 1-3 all-int params take them in the lc_p0..2 zero-page
+  // slots (the ABI that makes the draw builtins cheap) instead of the
+  // stack-machine C ABI's C-stack convention. LEAF fns (no user calls in the body) read the slots
   // directly - zero copies, zero BSS; non-leaf fns copy the slots into their
   // static locals first thing so nested zp calls can't clobber them. A call
   // site with one call-bearing arg stores it first; a fn ever called with
@@ -453,7 +453,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   for (const [name, fn] of functions) {
     // params <= 3 ONLY: extending to 5 was measured a net loss - combo-pool
     // gameplay 4.99 -> 5.50 (a hot 4-5 param physics fn is slower through
-    // the slots) vs celeste2's -0.07 win. gt_p3/gt_p4 stay reserved for a
+    // the slots) vs celeste2's -0.07 win. lc_p3/lc_p4 stay reserved for a
     // future per-shape gate.
     // under --num8 a fixed param IS int-width, so fixed-taking functions
     // (positions, speeds - the hot physics helpers) are zp-eligible too;
@@ -494,7 +494,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   const liveFns = new Set();
   {
     // roots: the lifecycle callbacks + any function whose ADDRESS was taken as a
-    // callback arg (fn kind) - those are reachable indirectly via SGDK.
+    // callback arg (fn kind) - those are reachable indirectly via the callback-based C SDK.
     const roots = ["_init", "_update", "_update60", "_draw"].filter((n) => functions.has(n));
     for (const [n, f] of functions) if (f.addressTaken) roots.push(n);
     const stack = roots;
@@ -568,7 +568,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         if (e.rndList) {
           // rnd({a,b,c}) -> pick a random element of the hidden const array
           const rl = e.rndList;
-          return cv(`${mangle(rl.name)}[gt_p8_rnd_int(${rl.len})]`, rl.kind, want);
+          return cv(`${mangle(rl.name)}[lc_rnd_int(${rl.len})]`, rl.kind, want);
         }
         if (want === "int") {
           const ri = rndIntForm(e);
@@ -624,14 +624,14 @@ export function emit(chunk, symbols, file, opts = {}) {
         const vt = v.tk === "fixed" ? "fixed" : "int";
         return `(${expr(v, vt)} ${c} ${nilSent(vt)})`;
       }
-      // BYTE COMPARES: a var<=var int comparison goes through cc65's
-      // tosicmp at ~127 cycles (measured; the constant form is ~15). When
+      // BYTE COMPARES: a var<=var int comparison goes through the 6502 C
+      // toolchain's tosicmp at ~127 cycles (measured; the constant form is ~15). When
       // both sides are provably 0..255 - narrowed loop counters, byte
       // constants, array8 reads - compare as unsigned char: lda/cmp.
       if (ck === "int" && byteish(e.left) && byteish(e.right)) {
         return `((unsigned char)${expr(e.left, "int")} ${c} (unsigned char)${expr(e.right, "int")})`;
       }
-      // var-vs-var int compares stack through cc65's ~127-cycle tosicmp;
+      // var-vs-var int compares stack through the 6502 C toolchain's ~127-cycle tosicmp;
       // subtract-then-test-vs-zero measures 147 vs 243 cyc/iter on the
       // reference loop. Exact whenever the true difference fits in 16
       // bits - a dialect guarantee for game data (coordinates, counters).
@@ -650,7 +650,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         return cv(`(${expr(e.left, k)} ${op} ${expr(e.right, k)})`, k, want);
       case "*": {
         if (k === "int") {
-          // strength-reduce x * C: cc65 lowers non-power-of-two constant
+          // strength-reduce x * C: the target C toolchain lowers non-power-of-two constant
           // multiplies to the generic runtime (~250+ cycles); a 2-3 term
           // shift-add is ~10x cheaper and bit-exact under 16-bit wrap
           const lc = constFold(e.left), rc = constFold(e.right);
@@ -672,7 +672,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         }
         // fixed result: (v<<16)*i == (v*i)<<16, so fixed*int needs only ONE
         // long multiply (or a shift for power-of-two ints) - far cheaper
-        // than the 4-partial-product gt_fmul.
+        // than the 4-partial-product lc_fmul.
         const intSide = e.left.tk === "int" ? e.left : (e.right.tk === "int" ? e.right : null);
         const fixSide = intSide === e.left ? e.right : e.left;
         if (intSide) {
@@ -707,7 +707,7 @@ export function emit(chunk, symbols, file, opts = {}) {
             }
           }
         }
-        return cv(fixedCall("gt_fmul", e.left, e.right), "fixed", want);
+        return cv(fixedCall("lc_fmul", e.left, e.right), "fixed", want);
       }
       case "/": {
         if (e.divConst) {
@@ -719,7 +719,7 @@ export function emit(chunk, symbols, file, opts = {}) {
           }
           return cv(`(${expr(e.left, "fixed")} >> ${lg})`, "fixed", want);
         }
-        return cv(fixedCall("gt_fdiv", e.left, e.right), "fixed", want);
+        return cv(fixedCall("lc_fdiv", e.left, e.right), "fixed", want);
       }
       case "\\": {
         const ok = e.operandKind ?? "int";
@@ -731,9 +731,9 @@ export function emit(chunk, symbols, file, opts = {}) {
         // hardware divide (gba/md): native C. 6502 targets: runtime helper.
         if (ok === "int") return cv(caps.nativeDiv
           ? `((${expr(e.left, "int")}) / (${expr(e.right, "int")}))`
-          : `gt_ifdiv(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
-        return cv(N8 ? `(${fixedCall("gt_fdiv", e.left, e.right)} >> 8)`
-                     : `(int)(${fixedCall("gt_fdiv", e.left, e.right)} >> 16)`, "int", want);
+          : `lc_ifdiv(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
+        return cv(N8 ? `(${fixedCall("lc_fdiv", e.left, e.right)} >> 8)`
+                     : `(int)(${fixedCall("lc_fdiv", e.left, e.right)} >> 16)`, "int", want);
       }
       case "%": {
         if (e.divConst) {
@@ -746,8 +746,8 @@ export function emit(chunk, symbols, file, opts = {}) {
           // 16.16 fixed modulo == a % b on the raw fixed ints (fraction preserved).
           return cv(`((${expr(e.left, "fixed")}) % (${expr(e.right, "fixed")}))`, "fixed", want);
         }
-        if (k === "int") return cv(`gt_ifmod(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
-        return cv(`gt_ffmod(${expr(e.left, "fixed")}, ${expr(e.right, "fixed")})`, "fixed", want);
+        if (k === "int") return cv(`lc_ifmod(${expr(e.left, "int")}, ${expr(e.right, "int")})`, "int", want);
+        return cv(`lc_ffmod(${expr(e.left, "fixed")}, ${expr(e.right, "fixed")})`, "fixed", want);
       }
       case "&": case "|":
         return cv(`(${expr(e.left, k)} ${op} ${expr(e.right, k)})`, k, want);
@@ -769,22 +769,22 @@ export function emit(chunk, symbols, file, opts = {}) {
 
   // Lower a fixed multiply/divide. Fast path: when neither operand can touch
   // the fixed runtime (which owns the zp slots fa/fb), store both operands into
-  // fa/fb and call the argless zp entry - no cc65 stack marshalling. Otherwise
+  // fa/fb and call the argless zp entry - no stack-machine C ABI marshalling. Otherwise
   // an operand's own fixed-runtime call would clobber fa/fb between the stage
-  // and the call, so fall back to the cdecl form. `fn` is "gt_fmul"|"gt_fdiv";
+  // and the call, so fall back to the cdecl form. `fn` is "lc_fmul"|"lc_fdiv";
   // the zp entry is `<fn>_zp`.
   function fixedCall(fn, left, right) {
     const L = expr(left, "fixed");
     const R = expr(right, "fixed");
     // Hardware-divide targets (gba/md): 16.16 fixed mul/div are NATIVE C via a
-    // 64-bit intermediate — the ARM7 and 68000 have hardware multiply + divide,
-    // so no runtime call and no zero-page staging (the whole gt_fmul/gt_fdiv/
+    // 64-bit intermediate - a CPU with hardware multiply + divide needs neither
+    // a runtime call nor zero-page staging (the whole lc_fmul/lc_fdiv/
     // fa/fb apparatus is a 6502 workaround better hardware doesn't need). The
     // fixedZp targets keep the runtime + zp-staging fast path.
     if (caps.nativeDiv) {
-      if (fn === "gt_fmul") return `(long)(((long long)(${L}) * (${R})) >> 16)`;
-      if (fn === "gt_fdiv") return `(long)((((long long)(${L})) << 16) / (${R}))`;
-      // gt_ffmod handled at its own call site; other fns shouldn't reach here.
+      if (fn === "lc_fmul") return `(long)(((long long)(${L}) * (${R})) >> 16)`;
+      if (fn === "lc_fdiv") return `(long)((((long long)(${L})) << 16) / (${R}))`;
+      // lc_ffmod handled at its own call site; other fns shouldn't reach here.
       return `${fn}(${L}, ${R})`;
     }
     // caps.fixedZp: the runtime provides zero-page-staged fixed mul/div entries
@@ -808,13 +808,13 @@ export function emit(chunk, symbols, file, opts = {}) {
     const b = expr(base, "int");
     if (off === 0) return `${sym}[${b}]`;
     // The pointer-fold form pays ONLY for BYTE-element arrays with a
-    // narrowed (u8) counter, where cc65 emits `lda _arr-1,y` direct
-    // (measured +30%). For INT/fixed arrays the fold breaks cc65's
+    // narrowed (u8) counter, where the 6502 C toolchain emits `lda _arr-1,y` direct
+    // (measured +30%). For INT/fixed arrays the fold breaks the toolchain's
     // known-global indexed addressing and every access goes through the
     // computed-pointer path - STORES land in jsr staspidx at ~90 cycles
     // apiece (measured: 2065 cycles per snow flake in newleste, 6x the
     // instruction-count estimate, via 25->10 count scaling). Int arrays
-    // keep the explicit subtract: (i-1) stays u8, cc65 does asl/tay/
+    // keep the explicit subtract: (i-1) stays u8, the toolchain does asl/tay/
     // lda _arr,y direct.
     if (byteElems && base.kind === "name" && narrowedVars.has(base.name)) {
       return `(${sym} ${off > 0 ? "+" : "-"} ${Math.abs(off)})[${b}]`;
@@ -860,12 +860,12 @@ export function emit(chunk, symbols, file, opts = {}) {
       case "coord": return expr(a, a.tk === "fixed" ? "int" : "int");
       case "int": return expr(a, "int");
       case "num": return expr(a, "fixed");
-      // A color is a raw GameTank palette byte. A STATIC 0-15 literal is a
-      // PICO-8 color index we bake to its GameTank byte at build time (the last
+      // A color is a raw target palette byte. A STATIC 0-15 literal is a
+      // PICO-8 color index we bake to its target byte at build time (the last
       // trace of the p8 palette, resolved here, not at runtime). Any other
       // expression is passed through as a raw byte - a value computed at runtime
       // is used as-is (a game that computes a 0-15 index will render wrong; the
-      // GameTank palette differs from PICO-8's, documented best-effort).
+      // target palette differs from PICO-8's, documented best-effort).
       case "color": {
         // colorBake targets: a static 0-15 P8 index bakes to
         // its raw platform palette byte at compile time (the runtime takes a raw
@@ -881,10 +881,10 @@ export function emit(chunk, symbols, file, opts = {}) {
       // int*/long* (the checker validated it's an array reference).
       // a callback: the address of a top-level Lua function (checker validated).
       // Flat ROM makes the indirect call safe; the ref keeps the call graph
-      // complete. Cast to void* so it fits any SGDK callback pointer type.
+      // complete. Cast to void* so it fits any callback-based C SDK's callback pointer type.
       case "fn": return a.callbackRef ? `(void*)&${mangle(a.callbackRef)}` : "0";
       // an opaque POINTER handle (Sprite*, sample blob, ...) carried as an int.
-      // Cast to void* so it fits the SGDK prototype's pointer type under -Werror.
+      // Cast to void* so it fits the target C SDK prototype's pointer type under -Werror.
       case "optr": return `(void*)(${expr(a, "int")})`;
       case "array":
       case "array8": return a.kind === "name" ? mangle(a.name) : "0";
@@ -897,18 +897,18 @@ export function emit(chunk, symbols, file, opts = {}) {
   function call(e) {
     const callee = e.callee;
 
-    // platform-extras namespace (gt.* / nes.* / c64.*): any target whose SDK
-    // passes a members table has one; gba/md do not.
+    // extras namespace (<NS>.*): any target whose SDK passes a members table
+    // has one; SDKs with no engine extras pass none.
     if (callee.kind === "member" && callee.object.kind === "name" && callee.object.name === NS) {
-      if (!GT_MEMBERS) {
+      if (!MEMBERS) {
         throw new Error(
-          `'${NS}.${callee.field}' is a GameTank-only verb and isn't available on this platform - ` +
-          `use the platform's verbs instead (see docs/CHEATSHEET.md).`,
+          `'${NS}.${callee.field}' is an engine verb this target's SDK does not provide - ` +
+          `use the target's own verbs instead (see the SDK's cheatsheet).`,
         );
       }
-      const sig = GT_MEMBERS[callee.field];
+      const sig = MEMBERS[callee.field];
       if (sig.special === "rgb") {
-        // gt.rgb(r,g,b) / gt.rgb(byte): a raw GameTank palette byte (0-255).
+        // <NS>.rgb(r,g,b) / <NS>.rgb(byte): a raw target palette byte (0-255).
         // (r,g,b) resolves to the nearest byte at COMPILE time (zero runtime
         // cost - the checker proved the 3 args constant); (byte) masks to 8 bits.
         if (e.args.length === 3) {
@@ -925,12 +925,12 @@ export function emit(chunk, symbols, file, opts = {}) {
         const fw = e.args[1].value, fh = e.args[2].value, fbw = e.args[4].value;
         const bh = expr(e.args[5], "int"), sh = expr(e.args[6], "int");
         const pr = expr(e.args[7], "int");
-        return `gt_hit_scan(${A.cname}_x, ${A.cname}_y, ${A.cname}_${fw}, ${A.cname}_${fh}, ${A.cname}_used, ${A.cname}_hi, ${B.cname}_x, ${B.cname}_y, ${B.cname}_${fbw}, ${B.cname}_used, ${B.cname}_hi, ${bh}, ${sh}, ${pr})`;
+        return `lc_hit_scan(${A.cname}_x, ${A.cname}_y, ${A.cname}_${fw}, ${A.cname}_${fh}, ${A.cname}_used, ${A.cname}_hi, ${B.cname}_x, ${B.cname}_y, ${B.cname}_${fbw}, ${B.cname}_used, ${B.cname}_hi, ${bh}, ${sh}, ${pr})`;
       }
       if (sig.special === "dbar") {
         const names = ["db_px", "db_py", "db_v", "db_m", "db_c", "db_c2", "db_bg"];
         // positions 4,5,6 (db_c, db_c2, db_bg) are colors: bake a static 0-15
-        // literal to its GameTank byte, like a `color` arg; else pass raw.
+        // literal to its target palette byte, like a `color` arg; else pass raw.
         const isColor = (i) => i >= 4;
         const parts = e.args.map((a, i) => {
           const v = (isColor(i) && a.kind === "number" && Number.isInteger(a.value) &&
@@ -938,36 +938,36 @@ export function emit(chunk, symbols, file, opts = {}) {
             ? String(P8_PALETTE[a.value]) : expr(a, "int");
           return `${names[i]} = (unsigned char)(${v})`;
         });
-        return `(${parts.join(", ")}, gt_dbar_z())`;
+        return `(${parts.join(", ")}, lc_dbar_z())`;
       }
       if (sig.special === "partsstep") {
         const pl = e.args[0].sym;
-        return `gt_parts_step(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_vx, ${pl.cname}_vy, ${pl.cname}_used, ${pl.cname}_hi)`;
+        return `lc_parts_step(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_vx, ${pl.cname}_vy, ${pl.cname}_used, ${pl.cname}_hi)`;
       }
       if (sig.special === "poolsprs") {
         const pl = e.args[0].sym;
         const fld = e.args[1].value;
         const ox = e.args[2] ? expr(e.args[2], "int") : "0";
         const oy = e.args[3] ? expr(e.args[3], "int") : "0";
-        return `gt_pool_sprs(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_used, ${pl.cname}_${fld}, ${pl.cname}_hi, ${ox}, ${oy})`;
+        return `lc_pool_sprs(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_used, ${pl.cname}_${fld}, ${pl.cname}_hi, ${ox}, ${oy})`;
       }
       if (sig.special === "poolmove") {
         const pl = e.args[0].sym;
         const mode = expr(e.args[1], "int");
-        return `gt_pool_move(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_sx, ${pl.cname}_sy, ${pl.cname}_used, ${pl.cname}_hi, ${mode})`;
+        return `lc_pool_move(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_sx, ${pl.cname}_sy, ${pl.cname}_used, ${pl.cname}_hi, ${mode})`;
       }
       if (sig.special === "poolanim") {
         const pl = e.args[0].sym;
         const f = e.args[1].value, sp = e.args[2].value, mx = e.args[3].value;
         const rst = e.args[4] ? expr(e.args[4], "int") : "16";   // reset frame (16ths; 16 = first)
-        return `gt_pool_anim(${pl.cname}_${f}, ${pl.cname}_${sp}, ${pl.cname}_${mx}, ${pl.cname}_used, ${pl.cname}_hi, ${rst})`;
+        return `lc_pool_anim(${pl.cname}_${f}, ${pl.cname}_${sp}, ${pl.cname}_${mx}, ${pl.cname}_used, ${pl.cname}_hi, ${rst})`;
       }
       if (sig.special === "pooledraw") {
         const pl = e.args[0].sym;
         const an = e.args[1].value, ty = e.args[2].value, fl = e.args[3].value, sh = e.args[4].value;
         const desc = expr(e.args[5], "array");
         const nud = expr(e.args[6], "int");
-        return `gt_pool_edraw(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_${an}, ${pl.cname}_${ty}, ${pl.cname}_${fl}, ${pl.cname}_${sh}, ${pl.cname}_used, ${pl.cname}_hi, ${desc}, ${nud})`;
+        return `lc_pool_edraw(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_${an}, ${pl.cname}_${ty}, ${pl.cname}_${fl}, ${pl.cname}_${sh}, ${pl.cname}_used, ${pl.cname}_hi, ${desc}, ${nud})`;
       }
       return `${sig.c}(${sig.params.map((p, i) => argAt(e, i, p[0], defaultFor(callee.field, i))).join(", ")})`;
     }
@@ -976,7 +976,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (e.userFn) {
       const fn = e.userFn;
       // INLINER: a body that is exactly `return <expr>` (no user calls inside)
-      // substitutes at the call site - the cc65 calling convention measured
+      // substitutes at the call site - the stack-machine cdecl ABI measured
       // ~1,200 cycles per invocation on a 4-line helper. Args paste in only
       // when pure (safe to duplicate) or used at most once; otherwise the
       // call stays. Kind conversion mirrors a real call (body at retKind,
@@ -1046,7 +1046,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         const bearing = e.args.map((a) => hasUserCall(a));
         const order = [...args.keys()].sort((x, y) =>
           (bearing[y] ? 1 : 0) - (bearing[x] ? 1 : 0));
-        const stores = order.map((i) => `gt_p${i} = ${args[i]}`);
+        const stores = order.map((i) => `lc_p${i} = ${args[i]}`);
         return `(${stores.join(", ")}, ${target}())`;
       }
       return `${target}(${args.join(", ")})`;
@@ -1057,8 +1057,8 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (!b) return "0";
 
     if (b.special === "print") {
-      // pf() = the print C-fn name, remapped gt_p8_* -> gba_* on the GBA target.
-      const pf = (suffix) => cName(`gt_p8_print${suffix}`);
+      // pf() = the print C-fn name, remapped lc_* -> gba_* on the GBA target.
+      const pf = (suffix) => cName(`lc_print${suffix}`);
       if (e.cursorForm) {
         // print(v) / print(v, color) - no x,y, uses the running cursor
         const c = e.args[1] ? argAt(e, 1, "color") : "-1";
@@ -1071,9 +1071,10 @@ export function emit(chunk, symbols, file, opts = {}) {
       }
       const x = expr(e.args[1], "int");
       const y = expr(e.args[2], "int");
-      // GameTank bakes the p8 index -> GT byte here (its resolve_color expects an
-      // already-baked byte). GBA passes the raw 0-15 index (argAt's color case is
-      // gated on the colorBake cap to skip the bake).
+      // colorBake targets bake the p8 index -> target palette byte here (their
+      // resolve_color expects an already-baked byte). Framebuffer targets pass the
+      // raw 0-15 index (argAt's color case is gated on the colorBake cap to skip
+      // the bake).
       const c = e.args[3] ? argAt(e, 3, "color") : "-1";
       if (e.printKind === "str") {
         const esc = String(e.args[0].value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -1088,7 +1089,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (b.special === "poolmove") {
       const pl = e.args[0].sym;
       const mode = expr(e.args[1], "int");
-      return `gt_pool_move(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_sx, ${pl.cname}_sy, ${pl.cname}_used, ${pl.cname}_hi, ${mode})`;
+      return `lc_pool_move(${pl.cname}_x, ${pl.cname}_y, ${pl.cname}_sx, ${pl.cname}_sy, ${pl.cname}_used, ${pl.cname}_hi, ${mode})`;
     }
     if (b.special === "add") return emitAdd(e);
     if (b.special === "del") {
@@ -1110,18 +1111,18 @@ export function emit(chunk, symbols, file, opts = {}) {
     const args = b.params.map((p, i) => argAt(e, i, p[0], defaultFor(name, i)));
 
     // The zero-page fastcall ABI: draw builtins store their args into the
-    // zp slots gt_a0.. (two sta's each) and call the argless _z entry point,
-    // instead of paying cc65's C-stack push per argument. Skipped when an
+    // zp slots lc_a0.. (two sta's each) and call the argless _z entry point,
+    // instead of paying the stack-machine C ABI's C-stack push per argument. Skipped when an
     // argument expression could itself draw (a user-function call would
     // clobber the slots mid-sequence) - those sites use the cdecl wrapper.
     // Zero-page fastcall (zpFastcall targets): draw builtins
-    // stage their args into gt_a0.. and call the argless _z entry. The
+    // stage their args into lc_a0.. and call the argless _z entry. The
     // hardware-stack targets (GBA/Genesis, no zp) skip the whole ZP-fastcall /
     // camera / btn-inline block: every builtin is a plain gba_*/md_* call from
     // the b.c fallthrough below.
     if (!caps.zpFastcall && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr packs its two flip flags into one int for the 5-param C signature
-      // (same shape as the GameTank cdecl fallback), everything else is plain.
+      // (same shape as the target cdecl fallback), everything else is plain.
       if (name === "spr") {
         return `${cName(b.c)}(${args[0]}, ${args[1]}, ${args[2]}, ${args[3]}, ${args[4]}, ${args[5]} | (${args[6]} << 1))`;
       }
@@ -1129,18 +1130,18 @@ export function emit(chunk, symbols, file, opts = {}) {
     }
     if (caps.zpFastcall && ZP_BUILTINS[name] && !e.args.some(hasUserCall)) {
       // spr has 7 params (n,x,y,w,h,flip_x,flip_y) but only 6 zp slots - pack
-      // the two flip flags into gt_a5 as a bitmask (bit0 = X, bit1 = Y). The
-      // asm reads gt_a5 to set WIDTH/HEIGHT bit7 + flip the GX/GY source edge.
+      // the two flip flags into lc_a5 as a bitmask (bit0 = X, bit1 = Y). The
+      // asm reads lc_a5 to set WIDTH/HEIGHT bit7 + flip the GX/GY source edge.
       if (name === "spr") {
-        const stores = [0, 1, 2, 3, 4].map((i) => `gt_a${i} = ${args[i]}`);
-        stores.push(`gt_a5 = ${args[5]} | (${args[6]} << 1)`);
+        const stores = [0, 1, 2, 3, 4].map((i) => `lc_a${i} = ${args[i]}`);
+        stores.push(`lc_a5 = ${args[5]} | (${args[6]} << 1)`);
         return `(${stores.join(", ")}, ${ZP_BUILTINS[name]}())`;
       }
-      const stores = args.map((a, i) => `gt_a${i} = ${a}`);
+      const stores = args.map((a, i) => `lc_a${i} = ${a}`);
       return `(${stores.join(", ")}, ${ZP_BUILTINS[name]}())`;
     }
     if (caps.zpFastcall && name === "camera" && !e.args.some(hasUserCall)) {
-      return `(gt_cam_x = ${args[0]}, gt_cam_y = ${args[1]})`;
+      return `(lc_cam_x = ${args[0]}, lc_cam_y = ${args[1]})`;
     }
     // btn/btnp with constant button + player 0/1: an inline bit test on the
     // zp pad word - no call at all (233 measured cycles down to a handful).
@@ -1150,7 +1151,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       const plArg = e.args[1];
       const plConst = !plArg ? 0 : (plArg.kind === "number" ? plArg.value | 0 : -1);
       if (idx >= 0 && idx <= 7 && (plConst === 0 || plConst === 1)) {
-        const word = (name === "btn" ? "gt_pad" : "gt_rpt") + plConst;
+        const word = (name === "btn" ? "lc_pad" : "lc_rpt") + plConst;
         return `((${word} & ${BTN_MASKS[idx]}u) != 0)`;
       }
     }
@@ -1159,11 +1160,11 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (name === "spr") {
       return `${cName(b.c)}(${args[0]}, ${args[1]}, ${args[2]}, ${args[3]}, ${args[4]}, ${args[5]} | (${args[6]} << 1))`;
     }
-    // sprf(frame,x,y,[fx],[fy]) -> gt_gspr_frame(frame,x,y, fx | (fy<<1))
+    // sprf(frame,x,y,[fx],[fy]) -> lc_gspr_frame(frame,x,y, fx | (fy<<1))
     if (name === "sprf") {
       return `${cName(b.c)}(${args[0]}, ${args[1]}, ${args[2]}, ${args[3]} | (${args[4]} << 1))`;
     }
-    // a pointer-returning SGDK call (retptr) hands back a Sprite*/Map*/... - cast
+    // a pointer-returning C SDK call (retptr) hands back a Sprite*/Map*/... - cast
     // it to int so the handle assigns cleanly to an int global under -Werror.
     if (b.retptr) return `(int)${cName(b.c)}(${args.join(", ")})`;
     return `${cName(b.c)}(${args.join(", ")})`;
@@ -1179,8 +1180,8 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (!c || c.kind !== "name" || c.name !== "rnd") return null;
     if (!e.args || e.args.length !== 1) return null;
     const a = e.args[0];
-    if (a.tk === "int") return `gt_p8_rnd_int(${expr(a, "int")})`;
-    if (a.kind === "number" && Number.isInteger(a.value)) return `gt_p8_rnd_int(${Math.trunc(a.value)})`;
+    if (a.tk === "int") return `lc_rnd_int(${expr(a, "int")})`;
+    if (a.kind === "number" && Number.isInteger(a.value)) return `lc_rnd_int(${Math.trunc(a.value)})`;
     return null;
   }
 
@@ -1212,7 +1213,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     switch (b.special) {
       case "flr": {
         const ri = rndIntForm(a0);
-        if (ri) return ri;      // flr(rnd(n)) -> gt_p8_rnd_int(n), bit-identical
+        if (ri) return ri;      // flr(rnd(n)) -> lc_rnd_int(n), bit-identical
         return a0.tk === "int" ? expr(a0, "int")
           : (N8 ? `(${expr(a0, "fixed")} >> 8)` : `(int)(${expr(a0, "fixed")} >> 16)`);
       }
@@ -1220,11 +1221,11 @@ export function emit(chunk, symbols, file, opts = {}) {
         return a0.tk === "int" ? expr(a0, "int")
           : (N8 ? `((${expr(a0, "fixed")} + 0xFF) >> 8)` : `(int)((${expr(a0, "fixed")} + 0xFFFFL) >> 16)`);
       case "abs":
-        return anyFixed ? `gt_abs${N8 ? "i" : "f"}(${expr(a0, "fixed")})` : `gt_absi(${expr(a0, "int")})`;
+        return anyFixed ? `lc_abs${N8 ? "i" : "f"}(${expr(a0, "fixed")})` : `lc_absi(${expr(a0, "int")})`;
       case "sgn":
-        return a0.tk === "int" ? `gt_sgni(${expr(a0, "int")})` : `gt_sgn${N8 ? "i" : "f"}(${expr(a0, "fixed")})`;
+        return a0.tk === "int" ? `lc_sgni(${expr(a0, "int")})` : `lc_sgn${N8 ? "i" : "f"}(${expr(a0, "fixed")})`;
       case "min": case "max": {
-        // int min/max of cheap PURE args inline as a ternary: a cc65 cdecl
+        // int min/max of cheap PURE args inline as a ternary: a stack-machine cdecl
         // call (3 pushes + jsr + compare) is ~250 cycles for what is 2
         // compares - and min/max/mid sit in the hottest loops of every game
         // (collision clamps, camera). Multi-eval is safe because cheapPure()
@@ -1239,7 +1240,7 @@ export function emit(chunk, symbols, file, opts = {}) {
           // (~127 cyc). The returned A/B keep the direct form.
           return `(${cmpCond(a0, second, op, mk)} ? (${A}) : (${B}))`;
         }
-        const fn = `gt_${b.special}${anyFixed && !N8 ? "f" : "i"}`;
+        const fn = `lc_${b.special}${anyFixed && !N8 ? "f" : "i"}`;
         const sec = e.args[1] ? expr(e.args[1], anyFixed ? "fixed" : "int") : (anyFixed ? "0L" : "0");
         return `${fn}(${expr(a0, anyFixed ? "fixed" : "int")}, ${sec})`;
       }
@@ -1255,7 +1256,7 @@ export function emit(chunk, symbols, file, opts = {}) {
           return `(${ab} ? (${bc} ? (${B}) : (${ac} ? (${C}) : (${A})))` +
                  ` : (${ac} ? (${A}) : (${bc} ? (${C}) : (${B}))))`;
         }
-        const fn = `gt_mid${anyFixed && !N8 ? "f" : "i"}`;
+        const fn = `lc_mid${anyFixed && !N8 ? "f" : "i"}`;
         const k = anyFixed ? "fixed" : "int";
         return `${fn}(${expr(e.args[0], k)}, ${expr(e.args[1], k)}, ${expr(e.args[2], k)})`;
       }
@@ -1272,14 +1273,14 @@ export function emit(chunk, symbols, file, opts = {}) {
         const cx = argAt(e, 0, "int", "0"), cy = argAt(e, 1, "int", "0");
         const sx = argAt(e, 2, "int", "0"), sy = argAt(e, 3, "int", "0");
         const cw = argAt(e, 4, "int", "128"), ch = argAt(e, 5, "int", "32");
-        return `gt_p8_map(gtl___p8map, 128, ${cx}, ${cy}, ${sx}, ${sy}, ${cw}, ${ch})`;
+        return `lc_map(lcl___p8map, 128, ${cx}, ${cy}, ${sx}, ${sy}, ${cw}, ${ch})`;
       }
       case "mget": {
         // mget(x,y) -> the tile index at map cell (x,y) in the 128-wide array
-        return `gtl___p8map[(${argAt(e, 1, "int", "0")}) * 128 + (${argAt(e, 0, "int", "0")})]`;
+        return `lcl___p8map[(${argAt(e, 1, "int", "0")}) * 128 + (${argAt(e, 0, "int", "0")})]`;
       }
       case "sspr": {
-        // sspr(sx,sy,sw,sh, dx,dy, [dw,dh], [flipx,flipy]) -> gt_p8_sspr.
+        // sspr(sx,sy,sw,sh, dx,dy, [dw,dh], [flipx,flipy]) -> lc_sspr.
         // dw/dh default to 0 (the C fn reads that as "= sw/sh"); flips pack into
         // one arg (bit0=X, bit1=Y).
         const sxv = argAt(e, 0, "int", "0"), syv = argAt(e, 1, "int", "0");
@@ -1288,7 +1289,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         const dwv = argAt(e, 6, "int", "0"), dhv = argAt(e, 7, "int", "0");
         const fx = e.args[8] ? `((${argAt(e, 8, "int", "0")}) ? 1 : 0)` : "0";
         const fy = e.args[9] ? `((${argAt(e, 9, "int", "0")}) ? 2 : 0)` : "0";
-        return `gt_p8_sspr(${sxv}, ${syv}, ${swv}, ${shv}, ${dxv}, ${dyv}, ${dwv}, ${dhv}, ${fx} | ${fy})`;
+        return `lc_sspr(${sxv}, ${syv}, ${swv}, ${shv}, ${dxv}, ${dyv}, ${dwv}, ${dhv}, ${fx} | ${fy})`;
       }
       default: return "0";
     }
@@ -1297,7 +1298,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   // ---- statements -------------------------------------------------------------
 
   // ---- literal-run packing: N consecutive `arr[k]=lit; arr[k+1]=lit; ...`
-  // statements each cost ~10-14 bytes of cc65 code; as a const table + copy
+  // statements each cost ~10-14 bytes of target C code; as a const table + copy
   // loop they cost the data + ~30 bytes. Big _init data blocks (sfx tables,
   // palettes, level data) shrink by ~70%. The table rides the function's
   // bank via the surrounding rodata-name pragma.
@@ -1331,7 +1332,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       const s = b.stmts[bi];
       const run = literalRun(b.stmts, bi);
       if (run) {
-        const id = `gtl__lit${runSeq++}`;
+        const id = `lcl__lit${runSeq++}`;
         const ct = run.tk === "fixed" ? ctype("fixed") : "int";
         const lits = run.vals.map((v) => expr(v, run.tk)).join(", ");
         line(`{ static const ${ct} ${id}[${run.vals.length}] = { ${lits} };`);
@@ -1397,7 +1398,7 @@ export function emit(chunk, symbols, file, opts = {}) {
       case "multiassign": {
         if (s.fromCall) {
           // a, b, c = f(...) : call once, then read result 1 + output slots.
-          // Value 1 is the call's return; values 2..N are the gt_mret_* slots
+          // Value 1 is the call's return; values 2..N are the lc_mret_* slots
           // the callee wrote. Assign into a temp first so a target that also
           // appears in the args isn't read after being overwritten.
           const k0 = s.targetKinds[0] ?? "int";
@@ -1406,7 +1407,7 @@ export function emit(chunk, symbols, file, opts = {}) {
           indent++;
           if (s.targets[0].kind === "name") line(`${mangle(s.targets[0].name)} = ${tn};`);
           for (let i = 1; i < s.targets.length; i++) {
-            if (s.targets[i].kind === "name") line(`${mangle(s.targets[i].name)} = gt_mret_${i};`);
+            if (s.targets[i].kind === "name") line(`${mangle(s.targets[i].name)} = lc_mret_${i};`);
           }
           indent--;
           line("}");
@@ -1439,7 +1440,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         // to a local FIRST (evaluation order - including rnd() state - is
         // exactly a call's), then emits the body with params mapped to the
         // bindings. With --static-locals each binding is an absolute store
-        // (~8 cycles) instead of cc65's pusha marshalling (~40/arg) plus
+        // (~8 cycles) instead of the stack-machine ABI's pusha marshalling (~40/arg) plus
         // (sp),y parameter reads in the callee: a 9-arg particle spawner
         // drops ~450 cycles per call. Gates: no return value (retKind
         // defaults to "int" - use hasReturnValue), no own locals (the
@@ -1517,7 +1518,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         // 8-bit narrowing: a counting loop whose bounds are compile-time
         // constants in [0, 254] (255 would wrap the ++ and never terminate),
         // stepping +1, whose variable is never assigned in the body, fits an
-        // unsigned char. cc65's char ops are roughly half the cost of int
+        // unsigned char. The 6502 toolchain's char ops are roughly half the cost of int
         // (single-register loads, 8-bit compare), and C's integer promotions
         // make every USE of the variable identical in value - PICO-8
         // semantics are untouched because the value provably stays in range.
@@ -1554,7 +1555,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         if (s.values && s.values.length > 1) {
           for (let i = 1; i < s.values.length; i++) {
             const k = fn?.retKinds?.[i] ?? "int";
-            line(`gt_mret_${i} = ${expr(s.values[i], k)};`);
+            line(`lc_mret_${i} = ${expr(s.values[i], k)};`);
           }
           line(`return ${expr(s.values[0], fn?.retKinds?.[0] ?? fn?.retKind ?? "int")};`);
           break;
@@ -1568,7 +1569,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         s.slotVar = sv;
         if (s.binding) s.binding.forallSlot = sv;
         // annotate: member nodes reference s (the forall) for slotVar
-        // (unsigned char index: pools cap at 64, and cc65 emits far tighter
+        // (unsigned char index: pools cap at 64, and the 6502 toolchain emits far tighter
         // indexing code for 8-bit induction variables)
         const pl = s.poolSym;
         line(`{ unsigned char ${sv};`);
@@ -1704,10 +1705,9 @@ export function emit(chunk, symbols, file, opts = {}) {
           const walk2 = (node) => {
             if (sfxConsumed || !node || typeof node !== "object") return;
             if (Array.isArray(node)) { for (const x of node) walk2(x); return; }
-            if (node.kind === "call" &&
-                (node.callee?.name === "sfx_bank" || node.callee?.name === "gt.sfx_bank" ||
-                 node.callee?.name === "music_bank" || node.callee?.name === "gt.music_bank" ||
-                 node.callee?.name === "song" || node.callee?.name === "gt.song") &&
+            const audioVerb = (n) => n === "sfx_bank" || n === "music_bank" || n === "song" ||
+                                     n === `${NS}.sfx_bank` || n === `${NS}.music_bank` || n === `${NS}.song`;
+            if (node.kind === "call" && audioVerb(node.callee?.name) &&
                 node.args?.some((a) => a?.kind === "name" && a.name === name)) { sfxConsumed = true; return; }
             for (const [k, v] of Object.entries(node)) if (!WALK_SKIP.has(k)) walk2(v);
           };
@@ -1778,7 +1778,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   }
   if (maxExtra > 0) {
     for (let i = 1; i <= maxExtra; i++) {
-      out.push(`${slotFixed[i] ? ctype("fixed") : "int"} gt_mret_${i};`);
+      out.push(`${slotFixed[i] ? ctype("fixed") : "int"} lc_mret_${i};`);
     }
     out.push("");
   }
@@ -1797,10 +1797,10 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (zpCall.has(s.name)) {
       const leaf = (callGraph.get(s.name) ?? new Set()).size === 0;
       if (leaf) {
-        zpParamMap = new Map(fn.params.map((p, i) => [p, `gt_p${i}`]));
+        zpParamMap = new Map(fn.params.map((p, i) => [p, `lc_p${i}`]));
       } else {
         for (let i = 0; i < fn.params.length; i++) {
-          out.push(`    ${ctype(fn.paramKinds[i])} ${mangle(fn.params[i])} = gt_p${i};`);
+          out.push(`    ${ctype(fn.paramKinds[i])} ${mangle(fn.params[i])} = lc_p${i};`);
         }
       }
     }
@@ -1838,7 +1838,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   const callCb = (name, ind) => {
     if (banked) {
       const b = bankOf(name);
-      if (b !== "fixed") out.push(`${ind}gt_bank(${BANK_NUMBER[b]});`);
+      if (b !== "fixed") out.push(`${ind}lc_bank(${BANK_NUMBER[b]});`);
     }
     out.push(`${ind}${mangle(name)}();`);
   };
@@ -1850,7 +1850,7 @@ export function emit(chunk, symbols, file, opts = {}) {
   emitHarness(out, harness, { has, callCb, thirty, usesAudio: symbols.usesAudio, usesMusic: symbols.usesMusic });
 
   // far-call stubs (assembled separately, linked into the FIXED bank).
-  // A stub forwards the cc65 fastcall registers blindly: A/X carry the last
+  // A stub forwards the 6502 fastcall registers blindly: A/X carry the last
   // argument (sreg its high word for longs) and the return value comes back
   // the same way - the stub saves A/X around the bank switches and never
   // touches sreg, so it works for every signature.
@@ -1859,7 +1859,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     const st = [];
     st.push(`; generated by ${sdkName} - FLASH2M cross-bank far-call stubs`);
     st.push(".PC02");
-    st.push(".import gt_bank_raw, gt_cur_bank");
+    st.push(".import lc_bank_raw, lc_cur_bank");
     for (const cn of stubbed) st.push(`.import _${mangle(cn)}`);
     for (const cn of stubbed) st.push(`.export _stub_${mangle(cn)}`);
     st.push("");
@@ -1873,17 +1873,17 @@ export function emit(chunk, symbols, file, opts = {}) {
       st.push(`_stub_${mangle(cn)}:`);
       st.push("        sta stub_sav_a");
       st.push("        stx stub_sav_x");
-      st.push("        lda gt_cur_bank");
+      st.push("        lda lc_cur_bank");
       st.push("        pha");
       st.push(`        lda #${bank}`);
-      st.push("        jsr gt_bank_raw");
+      st.push("        jsr lc_bank_raw");
       st.push("        lda stub_sav_a");
       st.push("        ldx stub_sav_x");
       st.push(`        jsr _${mangle(cn)}`);
       st.push("        sta stub_sav_a");
       st.push("        stx stub_sav_x");
       st.push("        pla");
-      st.push("        jsr gt_bank_raw");
+      st.push("        jsr lc_bank_raw");
       st.push("        lda stub_sav_a");
       st.push("        ldx stub_sav_x");
       st.push("        rts");
@@ -1892,20 +1892,20 @@ export function emit(chunk, symbols, file, opts = {}) {
     stubs = st.join("\n");
   }
 
-  // Banked builds: cc65 emits the string-literal pool at END-OF-UNIT under
+  // Banked builds: the 6502 C toolchain emits the string-literal pool at END-OF-UNIT under
   // whatever rodata-name is active THEN - after every scoped pragma has
   // popped - so print() literals would land in the near-full fixed bank.
   // A tail pragma routes the pool into bank 1 with the draw-path code.
   if (banked) out.push(`#pragma rodata-name ("B1RODATA")`, "");
 
   let cUnit = out.join("\n");
-  // caps.finalRename: a whole-unit gt_*→<prefix>_ collapse that cleans up the
+  // caps.finalRename: a whole-unit lc_*→<prefix>_ collapse that cleans up the
   // special-form emissions (mret_*, the a*/p* zp slots, fmul_zp, ...) which
   // bypass per-call cName. Targets whose per-call cName already covers every
   // emission (or that keep the raw schema, prefix "") set it false.
   if (caps.prefix && caps.finalRename) {
     const p = caps.prefix + "_";
-    cUnit = cUnit.replace(/\bgt_p8_/g, p).replace(/\bgt_/g, p);
+    cUnit = cUnit.replace(/\blc_/g, p);
   }
   return { c: cUnit, callGraph, stubs };
 }

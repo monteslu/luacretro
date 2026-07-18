@@ -7,11 +7,11 @@ import { compile } from "../compiler/index.js";
 // SDK's own suite via test/golden-c; this proves the front-end compiles for
 // every target and the target seams fire correctly.
 const CORE = {
-  cls:      { params: [["color", true]], ret: "void", c: "gt_p8_cls" },
-  rectfill: { params: [["coord", false], ["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "gt_p8_rectfill" },
-  circfill: { params: [["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "gt_p8_circfill" },
-  print:    { params: [["str", false], ["coord", true], ["coord", true], ["color", true]], ret: "void", c: "gt_p8_print" },
-  btn:      { params: [["int", false]], ret: "bool", c: "gt_p8_btn" },
+  cls:      { params: [["color", true]], ret: "void", c: "lc_cls" },
+  rectfill: { params: [["coord", false], ["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "lc_rectfill" },
+  circfill: { params: [["coord", false], ["coord", false], ["coord", false], ["color", true]], ret: "void", c: "lc_circfill" },
+  print:    { params: [["str", false], ["coord", true], ["coord", true], ["color", true]], ret: "void", c: "lc_print" },
+  btn:      { params: [["int", false]], ret: "bool", c: "lc_btn" },
   min:      { params: [["num", false], ["num", false]], ret: "same", special: "min" },
   flr:      { params: [["num", false]], ret: "int", special: "flr" },
 };
@@ -38,7 +38,7 @@ function desc({ prefix, caps, harness }) {
   };
 }
 const TARGETS = {
-  gametank: desc({ prefix: "", caps: { zpFastcall: true, zpUserFn: true, fixedZp: true, banked: true, colorBake: true },
+  gametank: desc({ prefix: "gt", caps: { zpFastcall: true, zpUserFn: true, fixedZp: true, banked: true, colorBake: true, finalRename: true },
                    harness: { init: ["gt_init"], loopTop: ["gt_update_inputs"], frameEnd: "gt_endframe", includes: ["gt_api.h"] } }),
   gba:      desc({ prefix: "gba", caps: { nativeDiv: true }, harness: { signature: "int main(void)", returns: true } }),
   md:       desc({ prefix: "md", caps: { zpUserFn: false, nativeDiv: true, finalRename: true },
@@ -106,7 +106,7 @@ test("gametank bakes color; gba/md pass raw", () => {
   const src = `function _draw() cls(1) end`;
   const gt = compile(src, "t.lua", { target: TARGETS.gametank, builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE });
   const gba = compile(src, "t.lua", { target: TARGETS.gba, builtins: CORE, callbacks: CALLBACKS });
-  assert.match(gt.c, /gt_p8_cls\(169\)/);   // P8 index 1 -> CAPTURE 169
+  assert.match(gt.c, /gt_cls\(169\)/);   // P8 index 1 -> CAPTURE 169
   assert.match(gba.c, /gba_cls\(1\)/);       // raw index
 });
 
