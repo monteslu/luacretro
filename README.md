@@ -1,5 +1,7 @@
 # luacretro
 
+[![npm version](https://img.shields.io/npm/v/luacretro.svg)](https://www.npmjs.com/package/luacretro) [![npm downloads](https://img.shields.io/npm/dm/luacretro.svg)](https://www.npmjs.com/package/luacretro)
+
 The shared Lua compiler front-end for the **gtlua** (GameTank / 6502),
 **gbalua** (Game Boy Advance / ARM), **mdlua** (Sega Genesis / 68000),
 **neslua** (NES / 6502), and **c64lua** (Commodore 64 / 6510) console SDKs.
