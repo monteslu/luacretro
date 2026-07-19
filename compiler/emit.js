@@ -111,12 +111,20 @@ const BANK_SEGMENTS = {
   b1: ["B1CODE", "B1RODATA"],
   b2: ["B2CODE", "B2RODATA"],
   // XL spill banks (bank 3 is the audio unit's private bank, so code spills to
-  // 4/5). Only used when the placer escalates to the XL layout; a 3-bank cart
-  // never places a function here.
+  // 4/5, and data-heavy carts continue into 6-13). Only used when the placer
+  // escalates to the XL layout; a 3-bank cart never places a function here.
   b4: ["B4CODE", "B4RODATA"],
   b5: ["B5CODE", "B5RODATA"],
+  b6: ["B6CODE", "B6RODATA"],
+  b7: ["B7CODE", "B7RODATA"],
+  b8: ["B8CODE", "B8RODATA"],
+  b9: ["B9CODE", "B9RODATA"],
+  b10: ["B10CODE", "B10RODATA"],
+  b11: ["B11CODE", "B11RODATA"],
+  b12: ["B12CODE", "B12RODATA"],
+  b13: ["B13CODE", "B13RODATA"],
 };
-const BANK_NUMBER = { b0: 0, b1: 1, b2: 2, b4: 4, b5: 5 };
+const BANK_NUMBER = { b0: 0, b1: 1, b2: 2, b4: 4, b5: 5, b6: 6, b7: 7, b8: 8, b9: 9, b10: 10, b11: 11, b12: 12, b13: 13 };
 
 // Draw builtins with a zero-page fastcall entry point (sdk/lc_blitq.s owns
 // the lc_a* slots; lc_api.h declares the _z functions).
@@ -1750,7 +1758,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         // indices from whatever bank happens to be live and blits noise.
         const home = name === "__p8map" ? "fixed"
           : (banked ? ([...rbanks].find((b) => b !== "fixed") ?? "fixed") : "fixed");
-        const seg = { b0: "B0RODATA", b1: "B1RODATA", b2: "B2RODATA", b3: "B3RODATA", b4: "B4RODATA", b5: "B5RODATA" }[home];
+        const seg = { b0: "B0RODATA", b1: "B1RODATA", b2: "B2RODATA", b3: "B3RODATA", b4: "B4RODATA", b5: "B5RODATA", b6: "B6RODATA", b7: "B7RODATA", b8: "B8RODATA", b9: "B9RODATA", b10: "B10RODATA", b11: "B11RODATA", b12: "B12RODATA", b13: "B13RODATA" }[home];
         const rows = [];
         for (let k = 0; k < g.hexdata.length; k += 16) {
           rows.push("    " + g.hexdata.slice(k, k + 16).map((b) => "0x" + b.toString(16).padStart(2, "0")).join(", "));
@@ -1843,7 +1851,7 @@ export function emit(chunk, symbols, file, opts = {}) {
     if (bankOf(s.name) === "fixed") emitFunction(s);
   }
   if (banked) {
-    for (const bank of ["b0", "b1", "b2", "b4", "b5"]) {
+    for (const bank of Object.keys(BANK_SEGMENTS)) {
       const group = fnStmts.filter((s) => bankOf(s.name) === bank);
       if (!group.length) continue;
       const [codeSeg, rodataSeg] = BANK_SEGMENTS[bank];
