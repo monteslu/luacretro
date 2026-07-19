@@ -438,6 +438,30 @@ export function emit(chunk, symbols, file, opts = {}) {
     callGraph.set(name, collectCallees(fn.node.body, functions));
   }
 
+  // Functions whose bodies READ a hexdata blob. On banked builds each blob is
+  // homed in ITS READER's bank, so inlining such a body into a caller placed
+  // in another bank turns the array read into a silent wrong-bank fetch (the
+  // SMB port's goombas fell through floors from exactly this). These stay
+  // real calls when banked.
+  const blobReaders = new Set();
+  if (banked) {
+    const blobNames = new Set();
+    for (const [gname, g] of globals) {
+      if (g.kind === "array" && g.hexdata) blobNames.add(gname);
+    }
+    for (const [name, fn] of functions) {
+      let found = false;
+      const walk = (node) => {
+        if (found || !node || typeof node !== "object") return;
+        if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+        if (node.kind === "index" && node.object?.kind === "name" && blobNames.has(node.object.name)) { found = true; return; }
+        for (const [k, v] of Object.entries(node)) if (!WALK_SKIP.has(k)) walk(v);
+      };
+      walk(fn.node?.body);
+      if (found) blobReaders.add(name);
+    }
+  }
+
   // ---- zp-fastcall for user functions ---------------------------------------
   // Functions with 1-3 all-int params take them in the lc_p0..2 zero-page
   // slots (the ABI that makes the draw builtins cheap) instead of the
@@ -982,7 +1006,8 @@ export function emit(chunk, symbols, file, opts = {}) {
       // call stays. Kind conversion mirrors a real call (body at retKind,
       // outer cv handles the rest).
       {
-        const body = inliner ? functions.get(callee.name)?.node?.body : null;
+        const body = inliner && !blobReaders.has(callee.name)
+          ? functions.get(callee.name)?.node?.body : null;
         if (body && !inlineStack.has(callee.name) &&
             e.args.length === fn.params.length && body.stmts.length > 1) {
           const chain = returnChain(body);
@@ -1005,7 +1030,7 @@ export function emit(chunk, symbols, file, opts = {}) {
         }
         const st = body && body.stmts.length === 1 ? body.stmts[0] : null;
         if (st && st.kind === "return" && st.value &&
-            !inlineStack.has(callee.name) &&
+            !inlineStack.has(callee.name) && !blobReaders.has(callee.name) &&
             e.args.length === fn.params.length && noCapture(callee.name)) {
           // side-effecting args (user calls) must be pasted EXACTLY once -
           // zero uses would drop the effect, two would double it - and at
@@ -1448,7 +1473,8 @@ export function emit(chunk, symbols, file, opts = {}) {
         // reference undeclared names), tiny body, capture-safe.
         const c = s.call;
         if (inliner && c.userFn && c.callee?.kind === "name" &&
-            !inlineStack.has(c.callee.name) && functions.has(c.callee.name)) {
+            !inlineStack.has(c.callee.name) && !blobReaders.has(c.callee.name) &&
+            functions.has(c.callee.name)) {
           const ifn = functions.get(c.callee.name);
           const ibody = ifn?.node?.body;
           const ownDecls = ibody ? declaredOf(c.callee.name) : null;
