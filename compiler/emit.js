@@ -1691,7 +1691,7 @@ export function emit(chunk, symbols, file, opts = {}) {
           const walk = (node) => {
             if (found || !node || typeof node !== "object") return;
             if (Array.isArray(node)) { for (const x of node) walk(x); return; }
-            if (node.kind === "index" && node.base?.kind === "name" && node.base.name === name) { found = true; return; }
+            if (node.kind === "index" && node.object?.kind === "name" && node.object.name === name) { found = true; return; }
             for (const [k, v] of Object.entries(node)) if (!WALK_SKIP.has(k)) walk(v);
           };
           walk(fn.node?.body);
@@ -1906,6 +1906,9 @@ export function emit(chunk, symbols, file, opts = {}) {
   if (caps.prefix && caps.finalRename) {
     const p = caps.prefix + "_";
     cUnit = cUnit.replace(/\blc_/g, p);
+    // the far-call stubs are a separate unit and reference the same runtime
+    // symbols (lc_bank_raw / lc_cur_bank) - rename them too
+    if (stubs) stubs = stubs.replace(/\blc_/g, p);
   }
   return { c: cUnit, callGraph, stubs };
 }
