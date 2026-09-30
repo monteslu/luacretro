@@ -188,9 +188,16 @@ static void mark_values(const lv *p, size_t n) {
 
 /* Conservative scan: any aligned 32-bit word that is the start address of
  * an allocated block keeps that block alive. */
+/* 32-bit words sit on 2-byte boundaries on the 68000 (and lv values with
+ * them), so the scan steps by the platform's word alignment. */
+#if defined(__m68k__)
+#define SCAN_STEP 2
+#else
+#define SCAN_STEP 4
+#endif
 void lc_gc_scan_range(const void *lo, const void *hi) {
-  uintptr_t a = ((uintptr_t)lo + 3) & ~(uintptr_t)3;
-  for (; a + 4 <= (uintptr_t)hi; a += 4) {
+  uintptr_t a = ((uintptr_t)lo + SCAN_STEP - 1) & ~(uintptr_t)(SCAN_STEP - 1);
+  for (; a + 4 <= (uintptr_t)hi; a += SCAN_STEP) {
     uint32_t w = *(const uint32_t *)a;
     const uint8_t *p = (const uint8_t *)(uintptr_t)w;
     if (p < A_lo || p >= A_hi) continue;
