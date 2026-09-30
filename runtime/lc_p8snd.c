@@ -38,7 +38,15 @@
  *
  * Noise uses the runtime's own xorshift where FAKE-08 calls rand(); the
  * conformance harness feeds FAKE-08 the same generator.
+ *
+ * Built with -DLC_P8SND_FAST this file is the cheap engine instead
+ * (lc_p8snd_fast.c, included below): the same sequencer and stat(), an
+ * approximate wavetable synth, for consoles that cannot afford this one. An
+ * SDK can equally compile lc_p8snd_fast.c in place of this file.
  */
+#ifdef LC_P8SND_FAST
+#include "lc_p8snd_fast.c"
+#else
 #include "lc_p8.h"
 
 /* Per-sample functions carry LC_P8SND_HOT so a platform can place them, e.g.
@@ -1117,3 +1125,39 @@ LC_P8SND_HOT void lc_p8_audio_fill(int16_t *out, int n) {
     out[i] = (int16_t)clampi(mix, -32767, 32767);
   }
 }
+
+/* ---- chip voices --------------------------------------------------------------- */
+/* Not cheap here: advancing means synthesizing (the sequencer is stepped by the
+ * mixer). The fast engine does both without synthesis. */
+void lc_p8_audio_advance(int samples) {
+  int16_t tmp[64];
+  while (samples > 0) {
+    int n = samples > 64 ? 64 : samples;
+    lc_p8_audio_fill(tmp, n);
+    samples -= n;
+  }
+}
+
+/* Each channel as the mixer last synthesized it. */
+int lc_p8_audio_voices(lc_p8_voice out[4]) {
+  int c, active = 0, half = p8_rd8(P8_HALFRATE);
+  for (c = 0; c < 4; ++c) {
+    const synth *s = &ch[c].last;
+    lc_p8_voice *o = &out[c];
+    int32_t e = (int32_t)((s->freq >> 23) & 255) - 142 - ((half >> c) & 1);   /* Hz Q8 */
+    uint32_t m = (s->freq & 0x7fffffu) | 0x800000u;
+    int32_t vol = s->vol;
+    o->active = 0; o->volume = 0; o->waveform = 0; o->noise = 0; o->freq_hz_q8 = 0;
+    if (ch[c].main.sfx < 0 || vol <= 0 || !(s->freq & 0x7f800000u)) continue;
+    if (s->is_music) vol = mulq30(vol, mus.fade_vol);
+    o->active = 1;
+    o->freq_hz_q8 = e >= 0 ? (e > 8 ? 0xffffffffu : m << e) : e > -32 ? m >> -e : 0;
+    o->volume = (uint8_t)(((int64_t)vol * 15 + (1 << 29)) >> 30);
+    if (!o->volume) o->volume = 1;
+    o->waveform = s->inst;
+    o->noise = s->inst == I_NOISE;
+    active++;
+  }
+  return active;
+}
+#endif

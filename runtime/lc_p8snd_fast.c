@@ -18,8 +18,12 @@
  *   tick that changes anything discrete (a note boundary, a loop wrap, an
  *   sfx end, a pattern end, a fade reaching zero, a pending music resume),
  *   jumps there, and replays only that tick with the exact engine's control
- *   code (copied from lc_p8snd.c, synthesis removed). stat(16..26, 46..57)
- *   therefore equals the exact engine's at every tick, not just per frame.
+ *   code (copied from lc_p8snd.c, synthesis removed). Quiet ticks are not
+ *   even applied one block at a time: they pile up and are applied at the
+ *   next event or read. Walks through the low binades after a launch or a
+ *   loop wrap are recorded once (walk tables, see LC_P8SND_ZTAB) and shared.
+ *   stat(16..26, 46..57) therefore equals the exact engine's at every tick,
+ *   not just per frame, and so does the full soft-double state.
  *
  *   SYNTHESIS (approximate). Once per block (LC_P8SND_BLOCK output samples,
  *   and always at a note boundary) each channel's note is evaluated: pitch
@@ -39,8 +43,17 @@
  * accumulator, so a GBA SDK can use 13379 or 10512 Hz and a Genesis SDK can
  * skip PCM entirely (lc_p8_audio_advance + lc_p8_audio_voices).
  *
- * Freestanding: stdint only, no float, no libc; 64-bit multiplies per block
- * and per sequencer event only, 32-bit work per sample.
+ * Chip voices: lc_p8_audio_advance runs the sequencer without synthesis and
+ * lc_p8_audio_voices reports each channel's pitch/volume/waveform after
+ * effects, for consoles that drive a sound chip (Genesis PSG/YM) instead.
+ *
+ * Knobs (all optional): LC_P8SND_RATE, LC_P8SND_BLOCK, the placement tiers
+ * below, LC_P8SND_BSS (placement of the walk tables), LC_P8SND_ZTAB and
+ * LC_P8SND_ZSEG (their count and length; smaller only costs speed).
+ *
+ * Freestanding: stdint only, no float, no libc calls (compilers may still
+ * emit memcpy for struct copies). 64-bit arithmetic only at sequencer events
+ * and block setup; per sample it is 32-bit adds, shifts and multiplies.
  */
 #include "lc_p8.h"
 
@@ -54,10 +67,22 @@
 #if LC_P8SND_BLOCK < 1 || LC_P8SND_BLOCK > 1024
 #error "LC_P8SND_BLOCK out of range"
 #endif
-/* Per-sample functions; on GBA:
- * -DLC_P8SND_HOT='__attribute__((section(".iwram"), target("arm")))' */
+/* Code placement, three tiers (each an attribute, default none):
+ *   LC_P8SND_HOT       the per-sample loops (oscillators, mixing), ~1.5 KB
+ *   LC_P8SND_PERBLOCK  once per block and channel (note evaluation, effects,
+ *                      the fill loop); defaults to LC_P8SND_HOT
+ *   LC_P8SND_WARM      the sequencer's event path (note boundaries, loop
+ *                      wraps, launches: a few thousand cycles each)
+ * On GBA: -DLC_P8SND_HOT='__attribute__((section(".iwram"), target("arm")))',
+ * and the same for the others if IWRAM allows (the bench reports sizes). */
 #ifndef LC_P8SND_HOT
 #define LC_P8SND_HOT
+#endif
+#ifndef LC_P8SND_PERBLOCK
+#define LC_P8SND_PERBLOCK LC_P8SND_HOT
+#endif
+#ifndef LC_P8SND_WARM
+#define LC_P8SND_WARM
 #endif
 
 #define TICK_RATE 22050u
@@ -95,19 +120,30 @@ static dbl d_add(dbl a, dbl b) {
   return d_round(x + y, a.e - 10, st);
 }
 
-static void d_step(dbl *a, const dbl *d) {
+/* a += d, as the exact engine's d_step computes it (one correctly rounded
+ * add), but without the general soft add when the sum crosses into the next
+ * binade: two guard bits and a sticky bit carry the rounding. */
+LC_P8SND_WARM static void d_step(dbl *a, const dbl *d) {
   if (a->m && a->e >= d->e) {
-    int sh = a->e - d->e;
-    uint64_t dint, rem, half, s;
-    if (sh >= 54) return;
-    dint = d->m >> sh;
-    s = a->m + dint;
-    if (sh) {
-      rem = d->m & (((uint64_t)1 << sh) - 1);
-      half = (uint64_t)1 << (sh - 1);
-      if (rem > half || (rem == half && (s & 1))) s++;
+    int sh = a->e - d->e, st = 0;
+    uint64_t y, t, m;
+    uint32_t r;
+    if (sh >= 54) return;                 /* d is under half an ulp of a */
+    if (sh >= 2) { y = d->m >> (sh - 2); st = (d->m & (((uint64_t)1 << (sh - 2)) - 1)) != 0; }
+    else y = d->m << (2 - sh);
+    t = (a->m << 2) + y;
+    if (t < (M53 << 2)) {                 /* still in a's binade */
+      m = t >> 2; r = (uint32_t)(t & 3);
+      if (r > 2 || (r == 2 && (st || (m & 1)))) m++;
+      if (m < M53) a->m = m;
+      else { a->m = m >> 1; a->e++; }
+      return;
     }
-    if (s < M53) { a->m = s; return; }
+    m = t >> 3; r = (uint32_t)(t & 7);    /* crossed: one more bit goes */
+    if (r > 4 || (r == 4 && (st || (m & 1)))) m++;
+    if (m == M53) { m >>= 1; a->e++; }
+    a->m = m; a->e++;
+    return;
   }
   *a = d_add(*a, *d);
 }
@@ -240,22 +276,44 @@ static f32 f_dbl(dbl a) {
 }
 
 /* float in [0, 1] -> Q15 */
-static int32_t f_q15(f32 v) {
+LC_P8SND_PERBLOCK static int32_t f_q15(f32 v) {
   int32_t e = (int32_t)((v >> 23) & 255) - 135;
   uint32_t m = (v & 0x7fffffu) | 0x800000u;
   if (!(v & 0x7f800000u) || (v & F_SIGN)) return 0;
   return (int32_t)(e >= 0 ? m << e : e > -32 ? m >> -e : 0);
 }
 
+static inline int msb32(uint32_t v) {                  /* v != 0 */
+#if defined(__ARM_FEATURE_CLZ) || defined(__x86_64__) || defined(__aarch64__)
+  return 31 - __builtin_clz(v);
+#else
+  int p = 0;                                             /* ARM7TDMI, 68000: no clz */
+  if (v >> 16) { v >>= 16; p += 16; }
+  if (v >> 8) { v >>= 8; p += 8; }
+  if (v >> 4) { v >>= 4; p += 4; }
+  if (v >> 2) { v >>= 2; p += 2; }
+  return p + (int)(v >> 1);
+#endif
+}
+
 /* ---- bounded division --------------------------------------------------------------- */
-/* min(num / den, cap), den != 0, cap < 2^32; restoring division over at most 32 bits. */
-static uint32_t udiv_cap(uint64_t num, uint64_t den, uint32_t cap) {
+/* min(num / den, cap), den != 0, cap < 2^32; restoring division over the
+ * quotient's bits only. */
+LC_P8SND_WARM static int msb64(uint64_t v) {                         /* v != 0 */
+  uint32_t hi = (uint32_t)(v >> 32);
+  return hi ? 32 + msb32(hi) : msb32((uint32_t)v);
+}
+
+LC_P8SND_WARM static uint32_t udiv_cap(uint64_t num, uint64_t den, uint32_t cap) {
   uint32_t q = 0;
   int b;
+  uint64_t d;
   if (num < den) return 0;
-  if ((num >> 32) >= den) return cap;
-  for (b = 31; b >= 0; b--)
-    if ((num >> b) >= den) { num -= den << b; q |= 1u << b; }
+  b = msb64(num) - msb64(den);
+  if (b > 31) return cap;
+  d = den << b;                             /* one variable shift, then by ones */
+  for (; b >= 0; b--, d >>= 1)
+    if (num >= d) { num -= d; q |= 1u << b; }
   return q < cap ? q : cap;
 }
 
@@ -576,7 +634,28 @@ static const int16_t wtab[8][2][256] = {
   },
 };
 
+/* 16x16->32 products: one mulu/muls on a 68000, where a 32-bit multiply is a
+ * libgcc call */
+#define MULU16(a, b) ((uint32_t)(uint16_t)(a) * (uint16_t)(b))
+#define MULS16(a, b) ((int32_t)(int16_t)(a) * (int16_t)(b))
+
 /* ---- linear runs -------------------------------------------------------------------- */
+/* a * b, for the run arithmetic (a < 2^53, the product < 2^64). On a 68000 a
+ * 64-bit multiply is a generic libgcc call; eight 16x16 products are cheaper. */
+static inline uint64_t mul64x32(uint64_t a, uint32_t b) {
+#if defined(__m68k__)
+  uint32_t b0 = b & 0xffffu, b1 = b >> 16, a0 = (uint32_t)a & 0xffffu, a1 = (uint32_t)a >> 16;
+  uint32_t a2 = (uint32_t)(a >> 32) & 0xffffu, a3 = (uint32_t)(a >> 48);
+  uint32_t m01 = MULU16(a0, b1);
+  uint64_t r = (uint64_t)MULU16(a0, b0) + ((uint64_t)(MULU16(a1, b0) + (m01 & 0xffffu)) << 16);
+  r += (uint64_t)((m01 >> 16) + MULU16(a1, b1) + MULU16(a2, b0)) << 32;
+  r += (uint64_t)(MULU16(a2, b1) + MULU16(a3, b0)) << 48;
+  return r;
+#else
+  return a * b;
+#endif
+}
+
 /* From v, how many d_steps each add exactly one constant to the mantissa
  * (0: the next step must be taken exactly; INF_TICKS with inc 0: frozen, the
  * step is under half an ulp). Inside a binade the in-binade path of d_step
@@ -584,65 +663,89 @@ static const int16_t wtab[8][2][256] = {
  * remainder, except on a tie, where it depends on parity, and a tie step
  * always lands on an even mantissa. So after at most one step the increment
  * is constant; comparing two consecutive steps proves it from here on. */
-static uint32_t lin_run(dbl v, const dbl *d, uint64_t *inc) {
-  dbl b = v, c;
-  uint64_t d1, d2;
+LC_P8SND_WARM static uint32_t lin_run(const dbl *v, const dbl *d, uint64_t *inc) {
+  int sh;
+  uint64_t dint, rem, half, step;
   *inc = 0;
-  if (!b.m) return 0;
-  d_step(&b, d);
-  if (b.e != v.e) return 0;
-  c = b;
-  d_step(&c, d);
-  if (c.e != b.e) return 0;
-  d1 = b.m - v.m; d2 = c.m - b.m;
-  if (d1 != d2) return 0;
-  if (!d1) return INF_TICKS;
-  *inc = d1;
-  return udiv_cap(M53 - 1 - v.m, d1, INF_TICKS - 1);
+  if (!v->m || v->e < d->e) return 0;        /* the soft-add path */
+  sh = v->e - d->e;
+  if (sh >= 54) return INF_TICKS;             /* d is under half an ulp: frozen */
+  dint = d->m >> sh;
+  rem = sh ? d->m & (((uint64_t)1 << sh) - 1) : 0;
+  half = sh ? (uint64_t)1 << (sh - 1) : 1;    /* sh 0: no remainder, never a tie */
+  if (rem != half) step = dint + (rem > half);
+  else {
+    step = dint + (dint & 1);                 /* from an even mantissa */
+    if (v->m & 1) return 0;                   /* odd: this one step differs */
+  }
+  if (!step) return INF_TICKS;
+  *inc = step;
+  return udiv_cap(M53 - 1 - v->m, step, INF_TICKS - 1);
 }
 
-/* ---- zero-start walks ---------------------------------------------------------------- */
-/* Offsets, sfx times and the music offset restart from 0 at every launch and
- * pattern, and the walk from 0 up through a dozen binades is where the exact
- * arithmetic costs (a soft add and a division per binade). The walk depends
- * only on the step, so it is recorded once per step as segments: at tick k0
- * the value is (m, e), and the next `left` ticks each add inc. */
-#ifndef LC_P8SND_BSS            /* placement of the walk tables (~6 KB), e.g. EWRAM */
+/* ---- walks ---------------------------------------------------------------------------- */
+/* Offsets, sfx times and the music offset restart at every launch, loop wrap
+ * and pattern, usually from 0 or from a small fraction, and the walk up
+ * through a dozen binades is where the exact arithmetic costs (a division
+ * and a rounding per binade). The walk depends only on the step and the
+ * start, so it is recorded once as segments: at tick k0 the value is (m, e),
+ * and the next `left` ticks each add inc. Zero-start walks are shared by
+ * every launch at the same speed; the looking up, the countdowns and the
+ * jumps all read the same record. */
+#ifndef LC_P8SND_BSS            /* placement of the walk tables (ZTAB * ZSEG * 32 bytes, 6 KB), e.g. EWRAM */
 #define LC_P8SND_BSS
 #endif
-#define ZSEG 48
-#define ZTAB 4
+#ifndef LC_P8SND_ZSEG                    /* segments per walk (a walk past them falls back) */
+#define LC_P8SND_ZSEG 48
+#endif
+#ifndef LC_P8SND_ZTAB                    /* walks kept, least recently used replaced */
+#define LC_P8SND_ZTAB 8
+#endif
+#define ZSEG LC_P8SND_ZSEG
+#define ZTAB LC_P8SND_ZTAB
 typedef struct { uint64_t m, inc; uint32_t k0, left; int32_t e; } zseg_t;
-typedef struct { dbl step; uint32_t age; uint16_t gen; uint8_t n; zseg_t s[ZSEG]; } ztab_t;
+typedef struct { dbl step, start; uint32_t age; uint16_t gen; uint8_t n; zseg_t s[ZSEG]; } ztab_t;
 static LC_P8SND_BSS ztab_t zt[ZTAB];
 static uint32_t zclock;
 
-static int z_extend(ztab_t *t) {
+LC_P8SND_WARM static int z_extend(ztab_t *t) {
   zseg_t *p, *q;
   dbl v;
   if (!t->n) {
     q = &t->s[0];
-    q->m = 0; q->e = 0; q->k0 = 0; q->left = 0; q->inc = 0;
+    q->m = t->start.m; q->e = t->start.e; q->k0 = 0;
+    q->left = lin_run(&t->start, &t->step, &q->inc);
     t->n = 1;
     return 1;
   }
   p = &t->s[t->n - 1];
   if (t->n == ZSEG || p->left == INF_TICKS) return 0;
-  v.m = p->m + p->inc * p->left; v.e = p->e;
+  v.m = p->m + mul64x32(p->inc, p->left); v.e = p->e;
   d_step(&v, &t->step);
   q = &t->s[t->n++];
   q->k0 = p->k0 + p->left + 1;
   q->m = v.m; q->e = v.e;
-  q->left = lin_run(v, &t->step, &q->inc);
+  q->left = lin_run(&v, &t->step, &q->inc);
   return 1;
 }
 
-static int z_for(const dbl *d) {
+LC_P8SND_WARM static int z_for(const dbl *d, const dbl *v) {
   int i, best = 0;
   for (i = 0; i < ZTAB; ++i)
-    if (zt[i].n && zt[i].step.m == d->m && zt[i].step.e == d->e) { zt[i].age = ++zclock; return i; }
-  for (i = 1; i < ZTAB; ++i) if (zt[i].age < zt[best].age) best = i;
-  zt[best].step = *d; zt[best].n = 0; zt[best].gen++; zt[best].age = ++zclock;
+    if (zt[i].n && zt[i].step.m == d->m && zt[i].step.e == d->e && zt[i].start.m == v->m && zt[i].start.e == v->e) {
+      zt[i].age = ++zclock;
+      return i;
+    }
+  /* a free slot, else the oldest walk that starts off zero (a loop wrap or
+   * an offset, rarely replayed), else the oldest zero-start walk (those are
+   * shared by every launch at their speed) */
+  best = -1;
+  for (i = 0; i < ZTAB && best < 0; ++i) if (!zt[i].n) best = i;
+  for (i = 0; i < ZTAB; ++i)
+    if (best < 0 || (zt[best].n && zt[i].start.m && (!zt[best].start.m || zt[i].age < zt[best].age))) best = i;
+  if (!zt[best].start.m && zt[best].n)
+    for (i = 0; i < ZTAB; ++i) if (zt[i].age < zt[best].age) best = i;
+  zt[best].step = *d; zt[best].start = *v; zt[best].n = 0; zt[best].gen++; zt[best].age = ++zclock;
   z_extend(&zt[best]);
   return best;
 }
@@ -662,74 +765,115 @@ typedef struct {
 
 static void acc_set(acc_t *a, dbl v) { a->v = v; a->ok = 0; a->z = -1; }
 
-static void acc_set_zero(acc_t *a, const dbl *d) {
-  a->v = d_int(0); a->ok = 0;
-  a->z = (int8_t)z_for(d); a->zgen = zt[a->z].gen; a->zk = 0; a->zi = 0;
+/* v, then stepping by d: through the walk table for (d, v) */
+LC_P8SND_WARM static void acc_set_at(acc_t *a, dbl v, const dbl *d) {
+  a->v = v; a->ok = 0;
+  a->z = (int8_t)z_for(d, &v); a->zgen = zt[a->z].gen; a->zk = 0; a->zi = 0;
 }
 
-/* the walk segment holding tick zk, or NULL (and z dropped) */
-static zseg_t *acc_zseg(acc_t *a, const dbl *d) {
+/* a's walk table if it still describes a's step, else NULL (z dropped) */
+LC_P8SND_WARM static ztab_t *acc_z(acc_t *a, const dbl *d) {
   ztab_t *t;
   if (a->z < 0) return 0;
   t = &zt[a->z];
   if (t->gen != a->zgen || t->step.m != d->m || t->step.e != d->e) { a->z = -1; return 0; }
+  return t;
+}
+
+/* the segment holding tick k, searching forward from *zi; NULL if the table
+ * is full before it */
+LC_P8SND_WARM static zseg_t *z_find(ztab_t *t, uint8_t *zi, uint32_t k) {
   for (;;) {
     zseg_t *s;
-    if (a->zi >= t->n && !z_extend(t)) { a->z = -1; return 0; }
-    s = &t->s[a->zi];
-    if (s->left == INF_TICKS || a->zk <= s->k0 + s->left) return s;
-    a->zi++;
+    if (*zi >= t->n && !z_extend(t)) return 0;
+    s = &t->s[*zi];
+    if (s->left == INF_TICKS || k <= s->k0 + s->left) return s;
+    ++*zi;
   }
 }
 
-static void acc_prep(acc_t *a, const dbl *d) {
-  zseg_t *s = acc_zseg(a, d);
+/* floor(m * 2^e) >= B, for the non-negative values here */
+LC_P8SND_WARM static int reaches(uint64_t m, int32_t e, uint32_t B) {
+  int sh = -e;
+  if (sh <= 0) return 1;
+  if (sh >= 64) return B == 0;
+  return (m >> sh) >= B;
+}
+
+LC_P8SND_WARM static void acc_prep(acc_t *a, const dbl *d) {
+  ztab_t *t = acc_z(a, d);
+  zseg_t *s = t ? z_find(t, &a->zi, a->zk) : 0;
   a->ok = 1;
   if (s) {
     a->inc = s->inc;
     a->left = s->left == INF_TICKS ? INF_TICKS : s->left - (a->zk - s->k0);
     return;
   }
-  a->left = lin_run(a->v, d, &a->inc);
+  a->z = -1;
+  a->left = lin_run(&a->v, d, &a->inc);
 }
 
-/* one exact step where no run applies: the next walk segment if there is one */
-static void acc_step1(acc_t *a, const dbl *d) {
-  if (a->z >= 0) {
-    zseg_t *s;
-    a->zk++;
-    s = acc_zseg(a, d);
-    if (s && s->k0 == a->zk) { a->v.m = s->m; a->v.e = s->e; a->ok = 0; return; }
-    a->zk--;
+LC_P8SND_WARM static void acc_jump(acc_t *a, const dbl *d, uint32_t n) {
+  if (a->z >= 0 && n > 1) {                  /* a recorded walk: one lookup */
+    ztab_t *t = acc_z(a, d);
+    zseg_t *s = t ? z_find(t, &a->zi, a->zk + n) : 0;
+    if (s) {
+      uint32_t j = a->zk + n - s->k0;
+      a->v.m = s->m + mul64x32(s->inc, j); a->v.e = s->e;
+      a->zk += n;
+      a->inc = s->inc; a->left = s->left == INF_TICKS ? INF_TICKS : s->left - j; a->ok = 1;
+      return;
+    }
     a->z = -1;
   }
-  d_step(&a->v, d);
-  a->ok = 0;
-}
-
-LC_P8SND_HOT static void acc_jump(acc_t *a, const dbl *d, uint32_t n) {
   while (n) {
     if (!a->ok) acc_prep(a, d);
     if (a->left == INF_TICKS) { a->zk += n; return; }
     if (a->left) {
       uint32_t j = n < a->left ? n : a->left;
-      a->v.m += a->inc * j;
+      a->v.m += mul64x32(a->inc, j);
       a->left -= j; a->zk += j; n -= j;
     } else {
-      acc_step1(a, d);
-      n--;
+      ztab_t *t = a->z >= 0 ? acc_z(a, d) : 0;
+      zseg_t *s = t ? z_find(t, &a->zi, a->zk + 1) : 0;
+      if (s && s->k0 == a->zk + 1) { a->v.m = s->m; a->v.e = s->e; }
+      else { a->z = -1; d_step(&a->v, d); }
+      a->zk++; a->ok = 0; n--;
     }
   }
 }
 
 /* Ticks until floor(v) >= B: the smallest k >= 1 such that k steps reach it,
- * or cap. Does not move a (it may fill a's cache). */
-static uint32_t acc_reach(acc_t *a, const dbl *d, uint32_t B, uint32_t cap) {
+ * or cap. Does not move a. */
+LC_P8SND_WARM static uint32_t acc_reach(acc_t *a, const dbl *d, uint32_t B, uint32_t cap) {
   acc_t x;
   uint32_t k = 0;
-  if ((uint32_t)d_floor(a->v) >= B) return 1;
+  ztab_t *t;
+  if (reaches(a->v.m, a->v.e, B)) return 1;
+  if ((t = acc_z(a, d)) != 0) {              /* scan the walk's segments */
+    uint8_t zi = a->zi;
+    uint32_t lo = a->zk + 1;
+    for (;;) {
+      zseg_t *s = z_find(t, &zi, lo);
+      uint64_t mlo;
+      uint32_t end;
+      if (!s) break;
+      mlo = s->m + mul64x32(s->inc, lo - s->k0);
+      if (reaches(mlo, s->e, B)) return lo - a->zk > cap ? cap : lo - a->zk;
+      if (s->left == INF_TICKS) return cap;
+      end = s->k0 + s->left;
+      if (end > lo && reaches(s->m + mul64x32(s->inc, s->left), s->e, B)) {
+        uint64_t thr = (uint64_t)B << -s->e;   /* < 2^53: the run's end reaches it */
+        uint32_t need = udiv_cap(thr - mlo - 1, s->inc, INF_TICKS - 1) + 1;
+        return lo + need - a->zk > cap ? cap : lo + need - a->zk;
+      }
+      if (end + 1 - a->zk >= cap) return cap;
+      lo = end + 1;
+    }
+  }
+  /* generic walk on a copy */
   if (!a->ok) acc_prep(a, d);
-  x = *a;
+  x.v = a->v; x.inc = a->inc; x.left = a->left; x.ok = a->ok; x.z = -1; x.zk = 0; x.zi = 0; x.zgen = 0;
   while (k < cap) {
     if (!x.ok) acc_prep(&x, d);
     if (x.left == INF_TICKS) return cap;
@@ -743,12 +887,12 @@ static uint32_t acc_reach(acc_t *a, const dbl *d, uint32_t B, uint32_t cap) {
           if (need <= j) return k + need;
         }
       }
-      x.v.m += x.inc * j;
-      x.left -= j; x.zk += j; k += j;
+      x.v.m += mul64x32(x.inc, j);
+      x.left -= j; k += j;
     } else {
-      acc_step1(&x, d);
-      k++;
-      if ((uint32_t)d_floor(x.v) >= B) return k;
+      d_step(&x.v, d);
+      x.ok = 0; k++;
+      if (reaches(x.v.m, x.v.e, B)) return k;
     }
   }
   return cap;
@@ -788,7 +932,7 @@ static void fade_prep(fade_t *f, f32 inc) {
   f->left = fade_lin(f->v, inc, &f->d);
 }
 
-LC_P8SND_HOT static void fade_jump(fade_t *f, f32 inc, uint32_t n) {
+LC_P8SND_PERBLOCK static void fade_jump(fade_t *f, f32 inc, uint32_t n) {
   while (n) {
     fade_prep(f, inc);
     if (f->left == INF_TICKS) return;
@@ -859,21 +1003,21 @@ static const uint8_t filt3[32] = {
 #define VIB_K 1044296u
 
 /* ---- memory accessors ------------------------------------------------------------ */
-static inline uint32_t sfx_addr(int n) { return P8_SFX + (uint32_t)n * 68u; }
-static inline uint8_t sfx_speed(int n) { return p8_rd8(sfx_addr(n) + 65); }
-static inline uint8_t sfx_lstart(int n) { return p8_rd8(sfx_addr(n) + 66); }
-static inline uint8_t sfx_lend(int n) { return p8_rd8(sfx_addr(n) + 67); }
-static inline uint8_t sfx_filters(int n) { return p8_rd8(sfx_addr(n) + 64); }
-static inline uint16_t sfx_note(int n, int i) {
-  uint32_t a = sfx_addr(n) + (uint32_t)i * 2u;
-  return (uint16_t)(p8_rd8(a) | (p8_rd8(a + 1) << 8));
-}
+/* Macros, not functions: the hot code is often compiled for another
+ * instruction set (ARM in IWRAM on GBA) and could not inline them. sfx 0..63
+ * and notes 0..31 stay below 0x4300, inside every LC_P8_MEMSIZE. */
+#define SFX_B(n, k)       (lc_p8mem[P8_SFX + (uint32_t)(n) * 68u + (uint32_t)(k)])
+#define sfx_speed(n)      SFX_B(n, 65)
+#define sfx_lstart(n)     SFX_B(n, 66)
+#define sfx_lend(n)       SFX_B(n, 67)
+#define sfx_filters(n)    SFX_B(n, 64)
+#define sfx_note(n, i)    ((uint16_t)(SFX_B(n, (uint32_t)(i) * 2u) | (SFX_B(n, (uint32_t)(i) * 2u + 1u) << 8)))
 #define N_KEY(w)    ((w) & 0x3f)
 #define N_WAVE(w)   ((((w) >> 6) & 3) | (((w) >> 6) & 4))
 #define N_VOL(w)    (((w) >> 9) & 7)
 #define N_FX(w)     (((w) >> 12) & 7)
 #define N_CUSTOM(w) (((w) >> 15) & 1)
-static inline uint8_t song_byte(int p, int i) { return p8_rd8(P8_MUSIC + (uint32_t)p * 4u + (uint32_t)i); }
+#define song_byte(p, i) (lc_p8mem[P8_MUSIC + (uint32_t)(p) * 4u + (uint32_t)(i)])
 
 /* ---- state ------------------------------------------------------------------------- */
 typedef struct {
@@ -909,12 +1053,12 @@ typedef struct {
   int8_t vc_note;
   uint8_t vc_ok, vc_half;
   /* custom instrument: tick-counting sub-sequencer */
-  int8_t cust_sfx;
-  int8_t cust_prev_key, cust_key;
-  int8_t cust_note;
+  int8_t cust_sfx;           /* instrument sfx, -1 when over */
+  int8_t cust_prev_key;
+  int8_t cust_cn, cust_et;   /* note index; the index it ends at (127: never) */
   uint8_t last_inst, last_key;
   int8_t last_note;
-  uint32_t cust_ticks;
+  uint32_t cust_rem, cust_dur, cust_inv;   /* ticks into the note, ticks per note, 2^31 / dur */
 } chan_t;
 
 static chan_t ch[4];
@@ -947,7 +1091,7 @@ static uint8_t last_half, last_pause;
 static uint32_t tacc;        /* output-rate remainder, units of 1/LC_P8SND_RATE tick */
 
 /* ---- sequencer: exact control, from lc_p8snd.c ---------------------------------- */
-static void cache_steps(sstate *s, int speed, int half) {
+LC_P8SND_WARM static void cache_steps(sstate *s, int speed, int half) {
   dbl ops;
   if (s->c_speed == speed && s->c_half == half) return;
   if (s->c_speed != speed) {
@@ -961,14 +1105,14 @@ static void cache_steps(sstate *s, int speed, int half) {
   s->stepq = d_frac32(s->step);
 }
 
-static void snap(sstate *s) {
+LC_P8SND_WARM static void snap(sstate *s) {
   s->nq_note = d_floor(s->off.v);
   s->nq_frac = d_frac32(s->off.v);
   s->nq_at = gt;
 }
 
 /* apply the pending quiet ticks */
-static void seq_sync(int half_reg) {
+LC_P8SND_WARM static void seq_sync(int half_reg) {
   int c;
   if (!pend) return;
   if (mus.pattern != -1) acc_jump(&mus.off, &music_step[half_reg & 1], pend);
@@ -982,15 +1126,14 @@ static void seq_sync(int half_reg) {
   pend = 0;
 }
 
-static void launch(int c, int sfx, dbl offset, int32_t length, int is_music, int half_reg) {
+LC_P8SND_WARM static void launch(int c, int sfx, dbl offset, int32_t length, int is_music, int half_reg) {
   chan_t *h = &ch[c];
   int sp = sfx_speed(sfx);
   h->main.sfx = (int16_t)sfx;
-  /* the step this channel will tick with, so the zero-start walks are shared */
+  /* the step this channel will tick with, so launches share their walks */
   cache_steps(&h->main, sp < 1 ? 1 : sp, (half_reg >> c) & 1);
-  if (offset.m) acc_set(&h->main.off, offset);
-  else acc_set_zero(&h->main.off, &h->main.step);
-  acc_set_zero(&h->main.time, &h->main.step);
+  acc_set_at(&h->main.off, offset, &h->main.step);
+  acc_set_at(&h->main.time, d_int(0), &h->main.step);
   h->main.ln_at = -1;
   h->length = length < 0 ? 0 : length;
   h->can_loop = 1;
@@ -1003,7 +1146,7 @@ static void launch(int c, int sfx, dbl offset, int32_t length, int is_music, int
 }
 
 /* the end condition of update_sfx for the current note */
-static int32_t end_time_of(sstate *cs, int idx, int note_id, int32_t length, int is_music,
+LC_P8SND_WARM static int32_t end_time_of(sstate *cs, int idx, int note_id, int32_t length, int is_music,
                            int lstart, int lend, int *has_end) {
   int32_t end_time = 32;
   *has_end = 0;
@@ -1025,7 +1168,7 @@ static int32_t end_time_of(sstate *cs, int idx, int note_id, int32_t length, int
 }
 
 /* update_sfx without the synthesis: one tick of one channel */
-static void seq_update(sstate *cs, int32_t length, int is_music, int can_loop, int chan_half) {
+LC_P8SND_WARM static void seq_update(sstate *cs, int32_t length, int is_music, int can_loop, int chan_half) {
   int idx, speed, lstart, lend, has_end, note_id, next_id;
   int32_t end_time;
   if (cs->sfx == -1) return;
@@ -1043,7 +1186,7 @@ static void seq_update(sstate *cs, int32_t length, int is_music, int can_loop, i
 
   if (lend > lstart && can_loop && next_id >= lend) {
     int32_t k = (next_id - lstart) / (lend - lstart);
-    acc_set(&cs->off, d_sub_int(cs->off.v, (uint32_t)(k * (lend - lstart))));
+    acc_set_at(&cs->off, d_sub_int(cs->off.v, (uint32_t)(k * (lend - lstart))), &cs->step);
     next_id = d_floor(cs->off.v);
   }
   end_time = end_time_of(cs, idx, note_id, length, is_music, lstart, lend, &has_end);
@@ -1100,7 +1243,7 @@ static void set_music_pattern(int pattern, int half_reg) {
   dur = dur_noloop > 0 ? dur_noloop : dur_loop;
   if (dur <= 0) dur = 32;
   mus.pattern = (int16_t)pattern;
-  acc_set_zero(&mus.off, &music_step[half_reg & 1]);
+  acc_set_at(&mus.off, d_int(0), &music_step[half_reg & 1]);
   mus.length = dur;
   for (i = 0; i < 4; ++i) {
     n = chans[i];
@@ -1112,7 +1255,7 @@ static void set_music_pattern(int pattern, int half_reg) {
 
 /* One tick of the whole machine, exactly as the exact engine's mixer loop runs
  * it (not paused). */
-static void seq_tick(int half_reg) {
+LC_P8SND_WARM static void seq_tick(int half_reg) {
   int c;
   for (c = 0; c < 4; ++c) {
     chan_t *h = &ch[c];
@@ -1152,7 +1295,7 @@ static void seq_tick(int half_reg) {
 }
 
 /* Quiet ticks before channel c's next event. */
-static uint32_t due_chan(int c, int half_reg) {
+LC_P8SND_WARM static uint32_t due_chan(int c, int half_reg) {
   chan_t *h = &ch[c];
   sstate *cs = &h->main;
   int idx, speed, lstart, lend, has_end, note_id;
@@ -1178,7 +1321,7 @@ static uint32_t due_chan(int c, int half_reg) {
 }
 
 /* Quiet ticks before the music's next event (pattern end, fade stop). */
-static uint32_t due_music(int half_reg) {
+LC_P8SND_WARM static uint32_t due_music(int half_reg) {
   int chalf = half_reg & 1;
   f32 inc = mus.inc_f[chalf];
   uint32_t q, k;
@@ -1192,7 +1335,7 @@ static uint32_t due_music(int half_reg) {
   return q;
 }
 
-static uint32_t due_recompute(int half_reg) {
+LC_P8SND_WARM static uint32_t due_recompute(int half_reg) {
   uint32_t m = INF_TICKS;
   int i;
   seq_sync(half_reg);
@@ -1207,7 +1350,7 @@ static uint32_t due_recompute(int half_reg) {
 static inline uint32_t due_min(int half_reg) { return dirty ? due_recompute(half_reg) : dmin; }
 
 /* n quiet ticks: only the music fade moves now (the synthesis reads it) */
-LC_P8SND_HOT static void seq_jump(int half_reg, uint32_t n) {
+LC_P8SND_PERBLOCK static void seq_jump(int half_reg, uint32_t n) {
   int i;
   if (mus.pattern != -1 && mus.inc_f[half_reg & 1]) fade_jump(&mus.fade, mus.inc_f[half_reg & 1], n);
   for (i = 0; i < 5; ++i) if (due[i] != INF_TICKS) due[i] -= n;
@@ -1216,7 +1359,7 @@ LC_P8SND_HOT static void seq_jump(int half_reg, uint32_t n) {
 }
 
 /* the event tick: replay it exactly; its owners (due 0) are recomputed */
-static void seq_event(int half_reg) {
+LC_P8SND_WARM static void seq_event(int half_reg) {
   int i;
   seq_sync(half_reg);
   for (i = 0; i < 5; ++i) {
@@ -1230,7 +1373,7 @@ static void seq_event(int half_reg) {
 }
 
 /* Advance the sequencer t ticks. */
-LC_P8SND_HOT static void seq_advance(int half_reg, uint32_t t) {
+LC_P8SND_PERBLOCK static void seq_advance(int half_reg, uint32_t t) {
   while (t) {
     uint32_t j = due_min(half_reg);
     if (j > t) j = t;
@@ -1245,7 +1388,7 @@ LC_P8SND_HOT static void seq_advance(int half_reg, uint32_t t) {
 }
 
 /* Output samples -> ticks through the remainder accumulator. */
-LC_P8SND_HOT static uint32_t ticks_for(uint32_t samples) {
+LC_P8SND_PERBLOCK static uint32_t ticks_for(uint32_t samples) {
 #if LC_P8SND_RATE == 22050
   return samples;
 #else
@@ -1258,7 +1401,7 @@ LC_P8SND_HOT static uint32_t ticks_for(uint32_t samples) {
 }
 
 /* Output samples until the tick after the next event has run (at least 1). */
-LC_P8SND_HOT static uint32_t samples_to_event(uint32_t cd, uint32_t maxs) {
+LC_P8SND_PERBLOCK static uint32_t samples_to_event(uint32_t cd, uint32_t maxs) {
   if (cd >= (uint32_t)maxs * 2u + 4u) return maxs;
 #if LC_P8SND_RATE == 22050
   return cd + 1 < maxs ? cd + 1 : maxs;
@@ -1273,45 +1416,49 @@ LC_P8SND_HOT static uint32_t samples_to_event(uint32_t cd, uint32_t maxs) {
 }
 
 /* ---- note evaluation (approximate, per block) ------------------------------------ */
-/* effects on (freq, vol) for note w of sfx idx at offset note_id + t16/65536 */
-LC_P8SND_HOT static void apply_fx(uint16_t w, int idx, int note_id, uint32_t t16, int speed, int prev_key,
-                                  int prev_vol, uint32_t *freq, int32_t *vol) {
+/* effects on (freq, vol) for note w of sfx idx at offset note_id + t16/65536.
+ * 16-bit products where the operands allow: the 68000 has no 32x32 multiply. */
+LC_P8SND_PERBLOCK static void apply_fx(uint16_t w, int idx, int note_id, uint32_t t16, int speed, int prev_key,
+                                       int prev_vol, uint32_t *freq, int32_t *vol) {
   uint32_t f = *freq;
   int32_t v = *vol;
   switch (N_FX(w)) {
   case FX_SLIDE: {
     int32_t pf = (int32_t)key_q8[prev_key & 63];
-    f = (uint32_t)(pf + (int32_t)(((int64_t)((int32_t)f - pf) * (int32_t)t16) >> 16));
+    f = (uint32_t)(pf + ((((int32_t)f - pf) * (int32_t)(t16 >> 6)) >> 10));
     if (prev_vol > 0) {
       int32_t pv = vol_q15[prev_vol & 7];
-      v = pv + (int32_t)(((int64_t)(v - pv) * (int32_t)t16) >> 16);
+      v = pv + (MULS16(v - pv, t16 >> 1) >> 15);
     }
     break;
   }
   case FX_VIBRATO:
   case FX_ARP_FAST:
   case FX_ARP_SLOW: {
-    uint32_t oq = ((uint32_t)note_id << 24) | (t16 << 8);             /* Q8.24 */
-    uint64_t pos = (((uint64_t)oq * (uint32_t)speed) * VIB_K) >> 16;   /* cycles, Q32 */
+    /* cycles = 7.5 * offset / offset_per_second = offset * speed * 183 * 7.5 / 22050:
+     * offset Q12 * speed * 0.995913, Q16 */
+    uint32_t q = (MULU16(note_id, speed) << 12) + MULU16(t16 >> 4, speed);
+    uint32_t pos = q - (MULU16(q >> 9, 268u) >> 7);
     if (N_FX(w) == FX_VIBRATO) {
-      int32_t fr = (int32_t)((uint32_t)pos >> 16), tv;
-      tv = (fr > 32768 ? fr - 32768 : 32768 - fr) - 16384;               /* Q16, +-0.25 */
-      f = f + (uint32_t)(((int64_t)f * tv * 3897) >> 32);                /* * (1 + 0.0594631 tv) */
+      int32_t fr = (int32_t)(pos & 0xffffu), tv;
+      tv = (fr > 32768 ? fr - 32768 : 32768 - fr) - 16384;       /* Q16, +-0.25 */
+      f = (uint32_t)((int32_t)f + (MULS16(f >> 5, MULS16(tv >> 1, 3897) >> 15) >> 11));   /* * (1 + 0.0594631 tv) */
     } else {
-      uint32_t m = (speed <= 8 ? 32u : 16u) >> (N_FX(w) == FX_ARP_FAST ? 2 : 3);
-      int n = (int)((pos * m) >> 32);
+      /* steps per cycle: (speed <= 8 ? 32 : 16) >> (fast ? 2 : 3), a power of two */
+      int sh = (speed <= 8 ? 5 : 4) - (N_FX(w) == FX_ARP_FAST ? 2 : 3);
+      int n = (int)((pos << sh) >> 16);
       f = key_q8[N_KEY(sfx_note(idx, (note_id & ~3) | (n & 3)))];
     }
     break;
   }
   case FX_DROP:
-    f = (uint32_t)(((uint64_t)f * (65536u - t16)) >> 16);
+    f = MULU16(f >> 4, (65536u - t16) >> 1) >> 11;
     break;
   case FX_FADE_IN:
-    v = (int32_t)(((int64_t)v * (int32_t)t16) >> 16);
+    v = (int32_t)(MULU16(v, t16) >> 16);
     break;
   case FX_FADE_OUT:
-    v = (int32_t)(((int64_t)v * (int32_t)(65536u - t16)) >> 16);
+    v = (int32_t)(((uint32_t)v * (65536u - t16)) >> 16);   /* 65536: not 16-bit */
     break;
   }
   *freq = f;
@@ -1319,55 +1466,49 @@ LC_P8SND_HOT static void apply_fx(uint16_t w, int idx, int note_id, uint32_t t16
 }
 
 /* the custom-instrument half of eval_voice; returns 1 when an instrument
- * note sounds (o, freq, vol updated), 0 for the fallback voice */
-static int eval_custom(chan_t *h, int inst, int key, int note_id, int hr, int chalf, voice_t *o,
-                       uint32_t *freq, int32_t *vol, int commit) {
-  int restart, csfx = h->cust_sfx, cnote = h->cust_note, cpk = h->cust_prev_key, ckey = h->cust_key, sounding = 0;
-  uint32_t ct = h->cust_ticks;
-  restart = inst != h->last_inst || key != h->last_key || note_id < h->last_note ||
-            (csfx < 0 && note_id != h->last_note);
-  if (restart) { csfx = inst; ct = 0; cpk = 24; cnote = -1; }
-  if (csfx >= 0) {
-    int ci = csfx, cs_sp = sfx_speed(ci), ls = sfx_lstart(ci), le = sfx_lend(ci), cn, has_end;
-    uint32_t dur, t2;
-    int32_t et;
-    uint16_t cw;
+ * note sounds (o, freq, vol updated), 0 for the fallback voice. The
+ * instrument's own sequencer is approximate: a tick count per note. */
+LC_P8SND_PERBLOCK static int eval_custom(chan_t *h, int inst, int key, int note_id, int hr, int chalf, voice_t *o,
+                                    uint32_t *freq, int32_t *vol, int commit) {
+  int csfx = h->cust_sfx, cn = h->cust_cn, cpk = h->cust_prev_key, et = h->cust_et, sounding = 0;
+  uint32_t rem = h->cust_rem, inv = h->cust_inv, dur = h->cust_dur;
+  if (inst != h->last_inst || key != h->last_key || note_id < h->last_note ||
+      (csfx < 0 && note_id != h->last_note)) {
+    int sp = sfx_speed(inst), ls = sfx_lstart(inst), le = sfx_lend(inst), has_end;
     sstate tmp;
-    if (cs_sp < 1) cs_sp = 1;
-    dur = 183u * (uint32_t)cs_sp << chalf;
-    cn = (int)(ct / dur);
-    if (le > ls && cn >= le) {
-      uint32_t base = (uint32_t)ls * dur;
-      ct = base + (ct - base) % ((uint32_t)(le - ls) * dur);
-      cn = (int)(ct / dur);
-    }
-    /* the sub-sequencer ends by sfx() rules: length 0, not music */
+    if (sp < 1) sp = 1;
+    csfx = inst; cn = 0; rem = 0; cpk = 24;
+    dur = 183u * (uint32_t)sp << chalf;
+    inv = (1u << 31) / dur;
+    /* it ends by sfx() rules: length 0, not music */
     tmp.ln_at = -1;
-    et = end_time_of(&tmp, ci, cn, 0, 0, ls, le, &has_end);
-    if (has_end && cn >= et) csfx = -1;
-    else if (cn < 32 && N_VOL(cw = sfx_note(ci, cn))) {
+    et = end_time_of(&tmp, inst, 0, 0, 0, ls, le, &has_end);
+    if (!has_end) et = 127;
+  }
+  if (csfx >= 0) {
+    uint16_t w;
+    if (cn >= et) csfx = -1;
+    else if (cn < 32 && N_VOL(w = sfx_note(csfx, cn))) {
       /* key * freq / key_q8[24] (66976); as in the exact engine, a slide's
        * start key and an arpeggio's keys are NOT scaled by the main note */
-      uint32_t cf = (uint32_t)(((uint64_t)key_q8[N_KEY(cw)] * *freq * 64127u) >> 32);
-      int32_t cv = vol_q15[N_VOL(cw)];
-      if (cn != cnote) {
-        if (cnote >= 0) cpk = ckey;
-        cnote = cn;
-        ckey = N_KEY(cw);
-      }
-      t2 = (((ct - (uint32_t)cn * dur) << 14) / dur) << 2;
-      apply_fx(cw, ci, cn, t2, cs_sp, cpk, 0, &cf, &cv);
+      uint32_t fac = *freq - (MULU16(*freq >> 4, 1409u) >> 12);  /* Q16: 65536 / 66976 */
+      uint32_t cf = MULU16(key_q8[N_KEY(w)] >> 4, fac >> 4) >> 8;
+      int32_t cv = vol_q15[N_VOL(w)];
+      uint32_t t16 = (rem * inv) >> 15;                          /* rem < dur: < 2^31 */
+      int sp = sfx_speed(csfx);
+      if (t16 > 65535u) t16 = 65535u;
+      if (N_FX(w)) apply_fx(w, csfx, cn, t16, sp < 1 ? 1 : sp, cpk, 0, &cf, &cv);
       *freq = hr ? cf >> 1 : cf;
-      *vol = (int32_t)(((int64_t)*vol * cv) >> 15);
-      o->wave = (uint8_t)N_WAVE(cw);
-      o->filters = sfx_filters(ci);
-      o->key = (uint8_t)N_KEY(cw);
+      *vol = MULS16(*vol, cv) >> 15;
+      o->wave = (uint8_t)N_WAVE(w);
+      o->filters = sfx_filters(csfx);
+      o->key = (uint8_t)N_KEY(w);
       sounding = 1;
     }
   }
   if (commit) {
-    h->cust_sfx = (int8_t)csfx; h->cust_ticks = ct; h->cust_note = (int8_t)cnote;
-    h->cust_prev_key = (int8_t)cpk; h->cust_key = (int8_t)ckey;
+    h->cust_sfx = (int8_t)csfx; h->cust_cn = (int8_t)cn; h->cust_rem = rem; h->cust_dur = dur;
+    h->cust_inv = inv; h->cust_prev_key = (int8_t)cpk; h->cust_et = (int8_t)et;
   }
   return sounding;
 }
@@ -1375,7 +1516,7 @@ static int eval_custom(chan_t *h, int inst, int key, int note_id, int hr, int ch
 /* The current note of channel c. commit: this is the block that will play,
  * so the custom-instrument sub-sequencer may restart / wrap / end. Returns 0
  * for silence. */
-LC_P8SND_HOT static int eval_voice(int c, int half_reg, voice_t *o, int commit) {
+LC_P8SND_PERBLOCK static int eval_voice(int c, int half_reg, voice_t *o, int commit) {
   chan_t *h = &ch[c];
   sstate *cs = &h->main;
   int idx, note_id, speed, key, lv, hr = (half_reg >> (c + 4)) & 1, chalf = (half_reg >> c) & 1;
@@ -1403,8 +1544,10 @@ LC_P8SND_HOT static int eval_voice(int c, int half_reg, voice_t *o, int commit) 
   speed = sfx_speed(idx);
   if (speed < 1) speed = 1;
   {
-    uint64_t f = (uint64_t)cs->nq_frac + (uint64_t)(gt - cs->nq_at) * cs->stepq;
-    t16 = f >> 32 ? 65535u : (uint32_t)f >> 16;
+    /* the offset's fraction now: never past 1 before the next event, so the
+     * product fits (the step's Q32 is truncated, so it can only undershoot) */
+    uint32_t el = gt - cs->nq_at, f = cs->nq_frac + el * cs->stepq;
+    t16 = f < cs->nq_frac ? 65535u : f >> 16;
   }
   freq = key_q8[key];
   vol = vol_q15[lv];
@@ -1418,17 +1561,18 @@ LC_P8SND_HOT static int eval_voice(int c, int half_reg, voice_t *o, int commit) 
     if (!eval_custom(h, inst, key, note_id, hr, chalf, o, &freq, &vol, commit))
       /* instrument over or a silent instrument note: the exact engine keeps the
        * main note's synth (the instrument number as waveform) at volume^2 */
-      vol = (int32_t)(((int64_t)vol * vol) >> 15);
+      vol = MULS16(vol, vol) >> 15;
     if (commit) { h->last_inst = (uint8_t)inst; h->last_key = (uint8_t)key; h->last_note = (int8_t)note_id; }
   } else if (commit) {
     h->last_inst = (uint8_t)N_WAVE(w); h->last_key = (uint8_t)key; h->last_note = (int8_t)note_id;
   }
   if (chalf) freq >>= 1;
-  if (h->is_music) vol = (int32_t)(((int64_t)vol * f_q15(mus.fade.v)) >> 15);
+  if (h->is_music) { int32_t fq = f_q15(mus.fade.v); vol = MULS16(vol, fq > 32767 ? 32767 : fq) >> 15; }
   o->freq = freq;
   o->vol = vol;
   if (commit && !N_FX(w) && !N_CUSTOM(w) &&
-      (!h->is_music || (!mus.fade_inf && !mus.inc_f[half_reg & 1]))) {
+      (!h->is_music || (!mus.fade_inf && (!mus.inc_f[half_reg & 1] ||
+                         (mus.fade.v == F_ONE && !(mus.inc_f[half_reg & 1] & F_SIGN)))))) {
     h->vc = *o; h->vc_sfx = (int16_t)idx; h->vc_note = (int8_t)note_id;
     h->vc_half = (uint8_t)half_reg; h->vc_ok = 1;
   }
@@ -1452,10 +1596,14 @@ LC_P8SND_HOT static void osc1(int32_t *mix, int n, const int16_t *tab, uint32_t 
 LC_P8SND_HOT static void osc2(int32_t *mix, int n, const int16_t *t1, uint32_t *ph1, uint32_t inc1, int32_t a1,
                               const int16_t *t2, uint32_t *ph2, uint32_t inc2, int32_t a2) {
   uint32_t p = *ph1, q = *ph2;
-  while (n--) {
-    p += inc1; q += inc2;
-    *mix++ += ((t1[p >> 24] * a1) >> 15) + ((t2[q >> 24] * a2) >> 15);
+  for (; n >= 2; n -= 2, mix += 2) {
+    int32_t x0, y0, x1, y1;
+    p += inc1; q += inc2; x0 = t1[p >> 24]; y0 = t2[q >> 24];
+    p += inc1; q += inc2; x1 = t1[p >> 24]; y1 = t2[q >> 24];
+    mix[0] += ((x0 * a1) >> 15) + ((y0 * a2) >> 15);
+    mix[1] += ((x1 * a1) >> 15) + ((y1 * a2) >> 15);
   }
+  if (n) { p += inc1; q += inc2; *mix += ((t1[p >> 24] * a1) >> 15) + ((t2[q >> 24] * a2) >> 15); }
   *ph1 = p; *ph2 = q;
 }
 
@@ -1479,7 +1627,7 @@ LC_P8SND_HOT static void noise(int32_t *mix, int n, uint32_t *ph, uint32_t inc, 
 static int32_t mixbuf[LC_P8SND_BLOCK];
 
 /* one channel for n samples, added into mix */
-LC_P8SND_HOT static void synth_block(int c, const voice_t *v, int32_t *mix, int n) {
+LC_P8SND_PERBLOCK static void synth_block(int c, const voice_t *v, int32_t *mix, int n) {
   chan_t *h = &ch[c];
   int buzz = (v->filters & 4) != 0, det = F_DETUNE(v->filters);
   uint32_t inc = (uint32_t)(((uint64_t)v->freq * INC_K) >> 16);
@@ -1549,7 +1697,6 @@ void lc_p8_audio_init(void) {
     ch[i].main.ln_at = -1;
     ch[i].main.off.z = ch[i].main.time.z = -1;
     ch[i].cust_sfx = -1;
-    ch[i].cust_note = -1;
   }
   for (i = 0; i < ZTAB; ++i) { zt[i].n = 0; zt[i].age = 0; }
   zclock = 0;
@@ -1659,12 +1806,23 @@ static int regs(int *half_reg) {
 }
 
 /* the custom-instrument sub-sequencers move with the ticks */
-static void cust_advance(uint32_t t) {
+LC_P8SND_PERBLOCK static void cust_advance(uint32_t t) {
   int c;
-  for (c = 0; c < 4; ++c) if (ch[c].cust_sfx >= 0) ch[c].cust_ticks += t;
+  for (c = 0; c < 4; ++c) {
+    chan_t *h = &ch[c];
+    if (h->cust_sfx < 0) continue;
+    h->cust_rem += t;
+    while (h->cust_rem >= h->cust_dur) {
+      int ls = sfx_lstart(h->cust_sfx), le = sfx_lend(h->cust_sfx);
+      h->cust_rem -= h->cust_dur;
+      if (h->cust_cn < 32) h->cust_prev_key = (int8_t)N_KEY(sfx_note(h->cust_sfx, h->cust_cn));
+      if (h->cust_cn < 127) h->cust_cn++;
+      if (le > ls && h->cust_cn >= le) h->cust_cn = (int8_t)ls;
+    }
+  }
 }
 
-LC_P8SND_HOT void lc_p8_audio_fill(int16_t *out, int n) {
+LC_P8SND_PERBLOCK void lc_p8_audio_fill(int16_t *out, int n) {
   int half_reg, pause = regs(&half_reg);
   uint8_t dist = p8_rd8(P8_DISTORT);
   while (n > 0) {
@@ -1703,7 +1861,10 @@ void lc_p8_audio_advance(int samples) {
     int s = samples > 4096 ? 4096 : samples, c;
     uint32_t t;
     voice_t v;
-    for (c = 0; c < 4; ++c) eval_voice(c, half_reg, &v, 1);   /* custom-instrument bookkeeping */
+    for (c = 0; c < 4; ++c) {                 /* custom-instrument bookkeeping */
+      const sstate *cs = &ch[c].main;
+      if (cs->sfx >= 0 && cs->nq_note < 32 && N_CUSTOM(sfx_note(cs->sfx, cs->nq_note))) eval_voice(c, half_reg, &v, 1);
+    }
     t = ticks_for((uint32_t)s);
     cust_advance(t);
     seq_advance(half_reg, t);

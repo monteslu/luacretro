@@ -17,6 +17,7 @@ export const RUNTIME_SOURCES = [
 ];
 export const RUNTIME_HEADERS = [
   "lc.h", "lc_int.h", "lc_lib.h", "lc_plat.h", "lc_p8.h", "lc_cart.h", "lc_trig.h",
+  "lc_p8snd_fast.c", // #included by lc_p8snd.c when built with -DLC_P8SND_FAST
 ];
 
 /** unicode text (from a .p8 or a .lua file) -> P8SCII byte string */
