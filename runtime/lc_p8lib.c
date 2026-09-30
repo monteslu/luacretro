@@ -319,8 +319,9 @@ LCB(poke) {
   uint16_t a = U16(0);
   p8_wr8(a, N > 1 ? (uint8_t)(NUM(1) >> 16) : 0);
   if (N > 2) {
-    int n = N - 2 > 8192 ? 8192 : N - 2;
-    for (int i = 1; i <= n; i++) p8_wr8((uint32_t)a + (uint32_t)i, (uint8_t)(NUM(1 + i) >> 16));
+    /* no 8192 cap: that limit is peek's count; zepto8 writes every value and
+     * carts poke whole 9 KB tables (FAKE-08 stops at 8192) */
+    for (int i = 1; i <= N - 2; i++) p8_wr8((uint32_t)a + (uint32_t)i, (uint8_t)(NUM(1 + i) >> 16));
   }
   return 0;
 }
@@ -329,15 +330,41 @@ LCB(peek2) { RET_INT(lc_p8_peek2(U16(0))); }
 LCB(poke2) {
   uint16_t a = U16(0);
   lc_p8_poke2(a, (int16_t)(N > 1 ? INT(1) : 0));
-  for (int i = 1; i <= N - 2; i++) lc_p8_poke2((uint32_t)a + (uint32_t)i, (int16_t)INT(1 + i));
+  /* consecutive values at consecutive addresses, as PICO-8 and zepto8 do
+   * (FAKE-08 steps the address by 1 and overlaps them) */
+  for (int i = 1; i <= N - 2; i++) lc_p8_poke2((uint32_t)a + 2u * (uint32_t)i, (int16_t)INT(1 + i));
   return 0;
 }
 LCB(peek4) { RET_NUM(lc_p8_peek4(U16(0))); }
 LCB(poke4) {
   uint16_t a = U16(0);
   lc_p8_poke4(a, N > 1 ? NUM(1) : 0);
-  for (int i = 1; i <= N - 2; i++) lc_p8_poke4((uint32_t)a + (uint32_t)i, NUM(1 + i));
+  for (int i = 1; i <= N - 2; i++) lc_p8_poke4((uint32_t)a + 4u * (uint32_t)i, NUM(1 + i));
   return 0;
+}
+
+/* poke/poke2/poke4(addr, unpack(t [, i [, j]])) fused by the compiler, so a
+ * large unpack never has to fit on the value stack. U holds unpack's UN
+ * arguments; w is the value width in bytes. */
+void lc_p8_poke_unpack(int w, int32_t addr, lv *U, int UN) {
+  lv tv = lc_arg(U, UN, 0);
+  if (LV_TAG(tv) != LT_TAB) lc_error("bad argument #1 to 'unpack' (table expected)");
+  lc_tab *t = (lc_tab *)LV_PTR(tv);
+  int32_t i = (UN >= 2 && U[1] != LV_NIL) ? (int16_t)(lc_argnum(U, UN, 1) >> 16) : 1;
+  int32_t e = (UN >= 3 && U[2] != LV_NIL) ? (int16_t)(lc_argnum(U, UN, 2) >> 16) : LV_N(lc_len(tv)) >> 16;
+  int32_t n = i > e ? 0 : e - i + 1;
+  uint32_t a = (uint16_t)(int16_t)(addr >> 16);
+  if (n == 0) {                              /* poke(a) writes a zero */
+    if (w == 1) p8_wr8(a, 0); else if (w == 2) lc_p8_poke2(a, 0); else lc_p8_poke4(a, 0);
+    return;
+  }
+  for (int32_t k = 0; k < n; k++) {
+    lv v = lc_tab_getint(t, i + k);
+    int32_t x = lc_argnum(&v, 1, 0);
+    if (w == 1) p8_wr8(a + (uint32_t)k, (uint8_t)(x >> 16));
+    else if (w == 2) lc_p8_poke2(a + 2u * (uint32_t)k, (int16_t)(x >> 16));
+    else lc_p8_poke4(a + 4u * (uint32_t)k, x);
+  }
 }
 
 LCB(reload) {

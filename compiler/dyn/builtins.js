@@ -33,7 +33,7 @@ export const BUILTINS = {
   srand: "srand", flip: "flip", run: "run", extcmd: "extcmd", stop: "stop",
   menuitem: "menuitem", serial: "serial", _set_fps: "noop", trace: "noop", save: "noop",
   info: "noop", abort: "noop", folder: "noop", resume: "noop", reboot: "noop", dir: "noop",
-  ls: "noop", load: "noop",
+  ls: "noop", load: "noop", holdframe: "noop",
 };
 
 /**

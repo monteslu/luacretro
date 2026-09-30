@@ -149,4 +149,20 @@ eq("env", envf(), 3)
 local keep = {}
 for i = 1, 2000 do local g = {i, tostr(i), {i}} if i % 100 == 0 then add(keep, g) end end
 eq("gc", keep[20][2], "2000")
+-- poke2/poke4 with several values write consecutively
+poke2(0x4300, 0x1234, 0x5678)
+eq("poke2multi", peek2(0x4302), 0x5678)
+poke4(0x4300, 1.5, -2)
+eq("poke4multi", peek4(0x4304), -2)
+-- poke(a, unpack(t)) with more values than the value stack could hold
+local big = {}
+for i = 1, 9000 do big[i] = i % 256 end
+poke(0x8000, unpack(big))
+eq("pokeunpack", peek(0x8000 + 8999), 9000 % 256)
+poke2(0x4300, unpack({7, 9}, 2))
+eq("poke2unpack", peek2(0x4300), 9)
+local pk = poke
+pk(0x4300, unpack({3, 4}))
+eq("pokeunpack_generic", peek(0x4301), 4)
+eq("unpackbig", select("#", unpack(big, 1, 5000)), 5000)
 printh(fails == 0 and "ALL OK" or (fails.." FAILED"))

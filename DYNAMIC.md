@@ -113,7 +113,12 @@ and keeps globals in a static array unless the cart uses `_ENV` as a value.
 - Where FAKE-08 and PICO-8 disagree and the right answer is known, this
   follows PICO-8: API number arguments floor rather than truncate; a cart's
   `flip()` waits a full frame at 30 fps; table fields that miss do not fall
-  back to globals.
+  back to globals; `poke2`/`poke4` with several values write them at
+  consecutive addresses and `poke` writes every value (zepto8 behavior).
+- Where a published cart depends on behavior neither reference has, the cart
+  wins: `add`/`del`/`deli` ignore a `false` collection like `nil`.
+- `holdframe()` is accepted and does nothing (frames are presented once per
+  frame anyway).
 - `pairs()` over tables whose keys are tables or functions iterates in heap
   address order, which no two implementations share.
 - `^` with a fractional exponent is computed with fixed-point log/exp and may

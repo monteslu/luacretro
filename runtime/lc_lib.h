@@ -30,6 +30,7 @@ lv lc_arg(lv *B, int N, int i);
 int32_t lc_sin_bits(int32_t x);
 int32_t lc_atan2_bits(int32_t x, int32_t y);
 int32_t lc_sqrt_bits(int32_t v);
+void lc_p8_poke_unpack(int w, int32_t addr, lv *U, int UN);
 
 /* inline helpers used by the typed fast paths in generated code */
 static inline int32_t lc_ceil(int32_t x) { return (int32_t)(0u - ((uint32_t)(0u - (uint32_t)x) & 0xffff0000u)); }

@@ -615,6 +615,17 @@ export function emitDynamic(chunk, opts) {
 
     function fastBuiltin(e) {
       if (e.kind !== "Call" || !isPureBuiltin(e.fn, res)) return null;
+      const pw = { poke: 1, poke2: 2, poke4: 4 }[e.fn.name];
+      const u = e.args[1];
+      if (pw && e.args.length === 2 && u.kind === "Call" && isPureBuiltin(u.fn, res) && u.fn.name === "unpack" &&
+          u.args.length >= 1 && u.args.length <= 3 && !isMulti(u.args[u.args.length - 1])) {
+        // poke*(a, unpack(t, ...)): write straight from the table, so a big
+        // unpack never has to fit on the value stack
+        const a = T("a"), b = T("b");
+        const pa = pushArgs(u.args, b);
+        return { c: `({ int32_t ${a} = ${toNum(ex(e.args[0]))}; lv *${b} = lc_top; ${pa.code.join(" ")} ` +
+          `lc_p8_poke_unpack(${pw}, ${a}, ${b}, ${pa.count}); lc_top = ${b}; })`, t: "void" };
+      }
       const spec = FAST[e.fn.name];
       if (!spec) return null;
       const n = e.args.length;

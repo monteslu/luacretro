@@ -489,7 +489,7 @@ LCB(unpack) {
   }
   if (i > e) return 0;
   int32_t n = e - i + 1;
-  if (n >= 8192 || B + n > lc_stack_hi) lc_error("too many results to unpack");
+  if (B + n > lc_stack_hi) lc_error("too many results to unpack");
   for (int32_t k = 0; k < n; k++) B[k] = lc_tab_getint(t, i + k);
   return (int)n;
 }
@@ -593,7 +593,9 @@ LCB(count) {
 
 LCB(add) {
   lv c = lc_arg(B, N, 0), x = lc_arg(B, N, 1);
-  if (c == LV_NIL) return 0;
+  /* a false collection is ignored like nil: carts on the BBS rely on
+   * deli(cond and t) (FAKE-08 and zepto8 raise on #false) */
+  if (!LV_TRUTHY(c)) return 0;
   int32_t n = LV_N(lc_len(c)) >> 16;
   int32_t i;
   if (N >= 3 && LV_TRUTHY(B[2])) {
@@ -610,7 +612,7 @@ LCB(add) {
 
 LCB(del) {
   lv c = lc_arg(B, N, 0), v = lc_arg(B, N, 1);
-  if (c == LV_NIL) return 0;
+  if (!LV_TRUTHY(c)) return 0;
   int32_t max = LV_N(lc_len(c)) >> 16;
   for (int32_t i = 1; i <= max; i++) {
     if (lc_eqv(lc_idx(c, LV_INT(i)), v)) {
@@ -624,7 +626,7 @@ LCB(del) {
 
 LCB(deli) {
   lv c = lc_arg(B, N, 0);
-  if (c == LV_NIL) return 0;
+  if (!LV_TRUTHY(c)) return 0;
   int32_t n = LV_N(lc_len(c)) >> 16;
   int32_t i;
   if (N >= 2 && LV_TRUTHY(B[1])) {
