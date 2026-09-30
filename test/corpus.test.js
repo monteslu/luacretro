@@ -124,3 +124,26 @@ test("sdkName threads into diagnostics", () => {
   assert.ok(!r.ok);
   assert.match(r.diagnostics.map(d => d.message).join("\n"), /gbalua has no implicit globals/);
 });
+
+// The far-call stubs are a SECOND unit returned alongside r.c, and they
+// reference the same runtime symbols. finalRename has to reach them too.
+// It did not in 0.1.0: r.c came out gt_-prefixed while the stubs still said
+// lc_bank_raw / lc_cur_bank, so every banked cart failed to link with
+// "2 unresolved external(s)". Nothing caught it because every assertion in
+// this file looked at r.c.
+test("banked: finalRename reaches the far-call stubs, not just the C unit", () => {
+  // emit does NOT decide banking: the SDK's build driver hands it a placement
+  // map. So drive it directly - put the callee in a non-fixed bank and the
+  // caller in another, which is exactly what forces a far-call stub.
+  const src = "function helper(x) return x + 1 end\n" +
+              "function _draw() cls(helper(1)) end";
+  const r = compile(src, "t.lua", {
+    target: TARGETS.gametank, builtins: CORE, callbacks: CALLBACKS, p8Palette: P8_PALETTE,
+    banked: true, inliner: false, // an inlined helper needs no far call
+    placement: { helper: "b1", _draw: "b2" },
+  });
+  assert.ok(r.stubs, "this source must produce far-call stubs or the test proves nothing");
+  assert.doesNotMatch(r.stubs, /\blc_/,
+    "stubs must not leak raw lc_ symbols - they will not link against the SDK");
+  assert.match(r.stubs, /\bgt_/, "stubs should carry the target prefix");
+});
