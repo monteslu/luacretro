@@ -9,12 +9,15 @@ import { loadCart, parseP8Text, decodeP8Png, decodeP8Rom, ROM_SIZE } from "../co
 import { inflateRaw, inflateZlib } from "../compiler/dyn/inflate.js";
 import { decodePng } from "../compiler/dyn/png.js";
 
-// Real carts are read in place, never copied into this repo (BBS carts are
-// CC BY-NC-SA). The root is the directory that CONTAINS the luacretro checkout
-// unless LUACRETRO_CARTS_ROOT says otherwise.
+// FAKE-08's own test carts (MIT) are vendored in test/fixtures/fake08.
+// Community carts are CC BY-NC-SA: read in place, never copied into this repo.
+// Their root is the directory that CONTAINS the luacretro checkout unless
+// LUACRETRO_CARTS_ROOT says otherwise; without them (a clean clone, CI) those
+// tests are skipped, and setting LUACRETRO_CARTS_ROOT makes them required.
+const FAKE08_CARTS = fileURLToPath(new URL("./fixtures/fake08/", import.meta.url));
 const ROOT = process.env.LUACRETRO_CARTS_ROOT ?? fileURLToPath(new URL("../../", import.meta.url));
-const FAKE08_CARTS = path.join(ROOT, "fake08-build/fake-08/test/carts");
 const COMMUNITY = path.join(ROOT, "fake08-build/community-carts");
+const HAVE_COMMUNITY = !!process.env.LUACRETRO_CARTS_ROOT || existsSync(COMMUNITY);
 
 /** Read a cart; a missing file FAILS the test (never skips) with the fix. */
 function cartBytes(file) {
@@ -260,7 +263,7 @@ const COMMUNITY_CARTS = {
 };
 
 for (const [file, want] of Object.entries(COMMUNITY_CARTS)) {
-  test(`community cart ${file}`, () => {
+  test(`community cart ${file}`, { skip: !HAVE_COMMUNITY && "community carts not present (set LUACRETRO_CARTS_ROOT)" }, () => {
     const bytes = cartBytes(path.join(COMMUNITY, file));
     if (want.error) {
       assert.throws(() => loadCart(bytes, file), want.error);
