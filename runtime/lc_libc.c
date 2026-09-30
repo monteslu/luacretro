@@ -8,6 +8,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* These loops ARE memcpy/memset: stop GCC from recognising the idiom and
+ * compiling them into calls to memcpy/memset, which would recurse forever
+ * (the weak definitions below win the link when the platform has no libc). */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("no-tree-loop-distribute-patterns")
+#endif
+
 void *lc_memcpy(void *d, const void *s, size_t n) {
   uint8_t *dp = (uint8_t *)d;
   const uint8_t *sp = (const uint8_t *)s;

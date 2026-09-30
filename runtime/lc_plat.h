@@ -37,6 +37,10 @@ void lc_plat_cartdata_save(const char *id, const uint8_t *data256);
  * value makes runs reproducible). */
 uint32_t lc_plat_seed(void);
 
+/* Wall clock for stat(80..85) (UTC) and stat(90..95) (local): year, month,
+ * day, hour, minute, second. A platform without a clock returns a fixed date. */
+void lc_plat_datetime(int out[6]);
+
 /* printh() */
 void lc_plat_log(const char *s, size_t len);
 

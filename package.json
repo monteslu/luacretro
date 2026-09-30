@@ -16,13 +16,17 @@
     "./emit": "./compiler/emit.js",
     "./peephole": "./compiler/peephole.js",
     "./core-builtins": "./compiler/core-builtins.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./dyn": "./compiler/dyn/index.js",
+    "./dyn/*": "./compiler/dyn/*",
+    "./runtime/*": "./runtime/*"
   },
   "files": [
     "compiler",
     "README.md",
     "LICENSE",
-    "SPEC.md"
+    "SPEC.md",
+    "runtime"
   ],
   "scripts": {
     "test": "node --test 'test/**/*.test.js'"

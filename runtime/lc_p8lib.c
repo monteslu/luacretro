@@ -274,6 +274,12 @@ LCB(stat) {
     case 30: B[0] = LV_FALSE; return 1;
     case 31: B[0] = LV_STR(lc_str_new("", 0)); return 1;
     case 32: case 33: case 34: RET_INT(0);
+    case 80: case 81: case 82: case 83: case 84: case 85:
+    case 90: case 91: case 92: case 93: case 94: case 95: {
+      int dt[6];
+      lc_plat_datetime(dt);
+      RET_INT(dt[n % 10]);
+    }
     case 100: B[0] = LV_STR(lc_str_new("", 0)); return 1;
     case 101: B[0] = LV_NIL; return 1;
     case 102: RET_INT(0);

@@ -36,7 +36,8 @@ static inline uint8_t get_nib(int x, int y, const uint8_t *buf) {
 
 static inline int16_t cam_x(void) { return p8_rd16(P8_CAMERA_X); }
 static inline int16_t cam_y(void) { return p8_rd16(P8_CAMERA_Y); }
-static inline int clamp_(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+/* FAKE-08 order (upper bound first) - matters when clip bounds cross */
+static inline int clamp_(int v, int lo, int hi) { v = v > hi ? hi : v; return v < lo ? lo : v; }
 
 static inline int in_clip(int x, int y) {
   return x >= DS(P8_CLIP_XB) && x < DS(P8_CLIP_XE) && y >= DS(P8_CLIP_YB) && y < DS(P8_CLIP_YE);
@@ -204,6 +205,7 @@ void lc_p8_line_to(int x1, int y1, int col) {
  * zero - bit-identical to the C++ expression without an FPU. Values are
  * carried as signed Q48 integers; anything below 2^-48 cannot change the
  * truncated result for the coordinate ranges involved. */
+#ifdef LC_NO_FLOAT
 static uint64_t f32_round_mag(uint64_t a) {
   /* round a magnitude (Q48) to a 24-bit mantissa */
   if (a < (1ull << 24)) return a;
@@ -214,7 +216,20 @@ static uint64_t f32_round_mag(uint64_t a) {
   if (rem > half || (rem == half && (q & 1))) q++;
   return q << shift;
 }
+#endif
 
+#ifndef LC_NO_FLOAT
+/* IEEE float32 arithmetic is exact to reproduce with real floats: the
+ * M33's FPU or libgcc's soft float give the same bits. The volatile
+ * temporaries keep each operation separately rounded (no fused
+ * multiply-add), as in the original expression. */
+static int interp_f32(int base, int num, int den, int span) {
+  volatile float q = (float)num / (float)den;
+  volatile float p = q * (float)span;
+  volatile float s = (float)base + p;
+  return (int)s;
+}
+#else
 static int interp_f32(int base, int num, int den, int span) {
   if (den == 0) return base;                       /* not reachable from tline */
   int neg = 0;
@@ -246,6 +261,7 @@ static int interp_f32(int base, int num, int den, int span) {
   int64_t t = (int64_t)(mag >> 48);
   return (int)(s < 0 ? -t : t);
 }
+#endif
 
 static int32_t tline_mask(uint8_t dim) {
   if (dim == 0) return 0xffffff;

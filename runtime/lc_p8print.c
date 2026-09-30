@@ -111,6 +111,24 @@ static int blit_glyph(const uint8_t *rows, int x, int y, uint8_t fg, uint8_t bg,
   }
   fg &= 0x0f;
   bg &= 0x0f;
+  if (wf == 1 && hf == 1 && !invert && !solid) {
+    /* the common case: plain glyph, visit only its set pixels */
+    int xb = lc_p8mem[P8_CLIP_XB], xe = lc_p8mem[P8_CLIP_XE];
+    int yb = lc_p8mem[P8_CLIP_YB], ye = lc_p8mem[P8_CLIP_YE];
+    int rows_n = chh < 8 ? chh : 8;
+    uint32_t mask = cw >= 8 ? 0xffu : ((1u << cw) - 1u);
+    for (int ry = 0; ry < rows_n; ry++) {
+      int ay = y + ry;
+      if (ay < yb || ay >= ye) continue;
+      uint32_t bits = rows[ry] & mask;
+      for (int col = 0; bits; col++, bits >>= 1) {
+        if (!(bits & 1)) continue;
+        int ax = x + col;
+        if (ax >= xb && ax < xe) put_nibble(base, ax, ay, fg);
+      }
+    }
+    return ew;
+  }
   /* only 8x8 of glyph data exists; larger cells are blank */
   for (int ry = 0; ry < chh * hf; ry++) {
     int row = ry / hf;

@@ -21,6 +21,13 @@
 
 typedef uint64_t lv;
 
+/* Placement for the runtime's large static buffers (PICO-8 RAM, the shared
+ * coroutine stacks). An SDK can point them at a bigger/slower memory, e.g.
+ * GBA EWRAM: -DLC_BIGDATA=__attribute__((section(".sbss"))). */
+#ifndef LC_BIGDATA
+#define LC_BIGDATA
+#endif
+
 enum {
   LT_NIL = 0, LT_FALSE, LT_TRUE, LT_NUM, LT_STR, LT_TAB, LT_FUN, LT_THR,
 };

@@ -9,6 +9,7 @@ import { lex } from "./lexer.js";
 import { parse } from "./parser.js";
 import { check } from "./check.js";
 import { emit } from "./emit.js";
+import { compileLua, toP8scii } from "./dyn/index.js";
 
 /**
  * @typedef {{file:string,line:number,col:number,severity:"error"|"warning",message:string}} Diagnostic
@@ -25,9 +26,14 @@ import { emit } from "./emit.js";
  *   - builtins, members, callbacks: the SDK's merged tables
  *   - p8Palette, nearestColorByte: color-bake tooling (colorBake targets only)
  *   - banked, placement, num8, inliner: build knobs (passthrough)
+ *   A target whose caps include `dynamic` gets the dynamic tier instead: full
+ *   PICO-8 Lua compiled against luacretro/runtime (see compiler/dyn/).
  * @returns {{ok, c, diagnostics, callGraph?, stubs?}}
  */
 export function compile(source, file = "main.lua", opts = {}) {
+  if (opts.target?.caps?.dynamic) {
+    return compileLua(toP8scii(source), { file, rom: opts.rom, debugLines: opts.debugLines });
+  }
   const sdkName = opts.sdkName;
   const { tokens, diagnostics: lexDiags } = lex(source, file);
   const { chunk, diagnostics: parseDiags } = parse(tokens, file, sdkName);

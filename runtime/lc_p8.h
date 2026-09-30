@@ -152,6 +152,27 @@ void lc_p8_music(int n, int fade_ms, int mask);
 int  lc_p8_audio_stat(int n);                   /* stat(16..26, 46..57) */
 /* Synthesize n samples of 22050 Hz mono s16 into out. */
 void lc_p8_audio_fill(int16_t *out, int n);
+/* Two engines implement the calls above, chosen at build time:
+ *   lc_p8snd.c          (default) exact fixed-point port of FAKE-08's synth.
+ *   lc_p8snd_fast.c     cheap engine for slow consoles: the same sequencer
+ *                       (stat() identical), approximate wavetable synthesis.
+ *                       Build it by compiling lc_p8snd.c with -DLC_P8SND_FAST,
+ *                       or by compiling lc_p8snd_fast.c in its place.
+ * The fast engine's output rate is LC_P8SND_RATE (default 22050): fill and
+ * advance count samples at that rate. The exact engine is always 22050. */
+
+/* ---- chip voices: drive a sound chip instead of mixing PCM ------------------------ */
+typedef struct {
+  uint8_t active;       /* channel sounding now */
+  uint8_t volume;       /* 0..15 after note volume, effects and the music fade (7 -> 15) */
+  uint8_t waveform;     /* 0..7: tri, tilted saw, saw, square, pulse, organ, noise, phaser */
+  uint8_t noise;        /* waveform == 6 */
+  uint32_t freq_hz_q8;  /* pitch in Hz, Q24.8, after slide/vibrato/drop/arpeggio */
+} lc_p8_voice;
+/* Each channel's voice right now; returns how many are active. */
+int lc_p8_audio_voices(lc_p8_voice out[4]);
+/* Advance the sequencer by `samples` output samples without synthesizing. */
+void lc_p8_audio_advance(int samples);
 
 /* ---- input (lc_p8sys.c) ---------------------------------------------------------------- */
 void lc_p8_update_buttons(void);

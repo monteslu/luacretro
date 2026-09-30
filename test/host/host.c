@@ -25,6 +25,10 @@ static int n_in;
 static uint8_t cur_mask;
 
 static void end_tick(void) {
+  if (getenv("LC_RAMDUMP_TICK") && atol(getenv("LC_RAMDUMP_TICK")) == tick) {
+    FILE *f = fopen(getenv("LC_RAMDUMP_FILE"), "wb");
+    if (f) { fwrite(lc_p8mem, 1, LC_P8_MEMSIZE, f); fclose(f); }
+  }
   tick++;
   for (int i = 0; i < n_in; i++) if (in_tick[i] == tick) cur_mask = in_mask[i];
   if (tick >= max_ticks) {
@@ -58,6 +62,7 @@ uint8_t lc_plat_buttons(int player) { return player == 0 ? cur_mask : 0; }
 int lc_plat_cartdata_load(const char *id, uint8_t *d) { (void)id; (void)d; return 0; }
 void lc_plat_cartdata_save(const char *id, const uint8_t *d) { (void)id; (void)d; }
 uint32_t lc_plat_seed(void) { return 0; }
+void lc_plat_datetime(int out[6]) { out[0] = 2024; out[1] = 1; out[2] = 1; out[3] = 12; out[4] = 0; out[5] = 0; }
 void lc_plat_log(const char *s, size_t len) { fwrite(s, 1, len, stdout); fputc('\n', stdout); }
 _Noreturn void lc_plat_fatal(const char *msg) {
   fprintf(stdout, "RUNTIME ERROR: %s\n", msg);
@@ -65,6 +70,8 @@ _Noreturn void lc_plat_fatal(const char *msg) {
   if (dump) fclose(dump);
   exit(2);
 }
+
+void lc_host_trace_rnd(uint32_t f, int32_t r) { fprintf(stderr, "RND %u %08x %d\n", f, (unsigned)r, lc_curline); }
 
 static lv vstack[16384];
 

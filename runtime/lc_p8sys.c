@@ -13,7 +13,7 @@
 #include "lc_plat.h"
 #include "lc_cart.h"
 
-uint8_t lc_p8mem[LC_P8_MEMSIZE];
+LC_BIGDATA uint8_t lc_p8mem[LC_P8_MEMSIZE];
 const uint8_t *lc_p8_cartrom;
 uint32_t lc_p8_frames;
 uint8_t lc_p8_fps = 30;
@@ -157,9 +157,13 @@ static void prng_step(void) {
 
 int32_t lc_p8_rnd(int32_t range) {
   prng_step();
+#ifdef LC_TRACE_RND
+  { extern void lc_host_trace_rnd(uint32_t f, int32_t r); lc_host_trace_rnd(lc_p8_frames, range); }
+#endif
   uint32_t b = p8_rd32(P8_RNG + 4);
   uint32_t r = (uint32_t)range;
-  return (int32_t)(r > 0 && range > 0 ? b % r : 0);
+  /* the range is taken as unsigned bits: rnd(-x) draws from [0, 2^32 - x) */
+  return (int32_t)(r > 0 ? b % r : 0);
 }
 
 void lc_p8_srand(int32_t seed) {
@@ -201,8 +205,12 @@ static size_t rt_vslots;
 static char *rt_cbase;
 static size_t rt_csize;
 
+volatile int lc_boot_stage;
+
 static _Noreturn void cart_boot(void) {
+  lc_boot_stage = 1;
   lc_init_rt(rt_arena, rt_arena_size, rt_vstack, rt_vslots, rt_cbase, rt_csize);
+  lc_boot_stage = 2;
   lc_p8_cartrom = lc_cart_rom;
   lc_p8_reset_memory();
   lc_p8_reset_drawstate();
@@ -210,9 +218,13 @@ static _Noreturn void cart_boot(void) {
   lc_p8_srand((int32_t)lc_plat_seed());
   for (int p = 0; p < 8; p++) { held[p] = down[p] = prevheld[p] = 0; for (int i = 0; i < 8; i++) frames_held[p][i] = 0; }
   lc_p8_frames = 1;
+  lc_boot_stage = 3;
   lc_cart_setup();
+  lc_boot_stage = 4;
   lc_init_rt_names();
+  lc_boot_stage = 5;
   lc_cart_main();
+  lc_boot_stage = 6;
   /* PICO-8 picks the frame rate once the program has defined its callbacks */
   lc_p8_fps = lc_cart_cb(LC_CB_UPDATE60) != LV_NIL ? 60 : 30;
   lv init = lc_cart_cb(LC_CB_INIT);
@@ -243,11 +255,21 @@ static _Noreturn void cart_boot(void) {
 void lc_ctx_swap(void **save_sp, void *new_sp);
 
 /* Start (or restart) the cart on a fresh frame at the top of the main C
- * stack. Whatever was running is abandoned, which is exactly run(). */
+ * stack. Whatever was running is abandoned, which is exactly run(). The
+ * new frame is built from a small separate boot stack, because the code
+ * doing the switch may itself be running in the region being rebuilt. */
+static uint8_t boot_stack[256] __attribute__((aligned(16)));
+static void *boot_sp, *dead_sp;
+
+static _Noreturn void boot_trampoline(void) {
+  void *sp = lc_ctx_prepare(((uintptr_t)rt_cbase - 64) & ~(uintptr_t)15, cart_boot);
+  lc_ctx_swap(&boot_sp, sp);
+  for (;;) {}
+}
+
 static _Noreturn void start_fresh(void) {
-  void *dummy;
-  void *sp = lc_ctx_prepare(((uintptr_t)rt_cbase - 256) & ~(uintptr_t)15, cart_boot);
-  lc_ctx_swap(&dummy, sp);
+  void *sp = lc_ctx_prepare((uintptr_t)(boot_stack + sizeof boot_stack), boot_trampoline);
+  lc_ctx_swap(&dead_sp, sp);
   for (;;) {}
 }
 

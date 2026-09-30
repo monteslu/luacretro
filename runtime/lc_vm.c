@@ -294,14 +294,14 @@ lv lc_len(lv v) {
 /* ---- indexing ------------------------------------------------------------------- */
 
 static lv string_index(lv s, lv k) {
-  /* PICO-8: s[i] is sub(s,i,i) */
-  int32_t n;
-  if (!lc_tonum(k, &n)) return LV_NIL;
+  /* z8lua luaV_gettable: str[k] is sub(str,k,k) with negative k from the
+   * end, and nil (not "") out of range; string metatables are not used */
+  if (!LV_ISNUM(k)) return LV_NIL;
   lc_str *str = (lc_str *)LV_PTR(s);
-  int32_t i = n >> 16;
-  if (i < 0) i = (int32_t)str->len + i + 1;
-  if (i < 1 || (uint32_t)i > str->len) return LV_STR(lc_str_new("", 0));
-  return LV_STR(lc_str_new(str->data + i - 1, 1));
+  int32_t kk = LV_N(k) >> 16;
+  uint32_t idx = kk > 0 ? (uint32_t)(kk - 1) : (uint32_t)((int32_t)str->len + kk);
+  if (idx >= str->len) return LV_NIL;
+  return LV_STR(lc_str_new(str->data + idx, 1));
 }
 
 lv lc_index(lv o, lv k) {
@@ -315,9 +315,7 @@ lv lc_index(lv o, lv k) {
       tm = lc_tab_getstr(t->meta, lc_tmname[TM_INDEX]);
       if (tm == LV_NIL) return LV_NIL;
     } else if (LV_TAG(o) == LT_STR) {
-      if (!lc_string_meta) return string_index(o, k);
-      tm = lc_tab_getstr(lc_string_meta, lc_tmname[TM_INDEX]);
-      if (tm == LV_NIL) return string_index(o, k);
+      return string_index(o, k);
     } else {
       tm = lc_gettm(o, TM_INDEX);
       if (tm == LV_NIL) {

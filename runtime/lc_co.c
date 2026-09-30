@@ -120,8 +120,8 @@ static lc_thr *cur;
 static char *main_clo, *main_chi;
 static lv *main_vlo, *main_vhi;
 
-static uint8_t co_cregion[LC_CO_REGION] __attribute__((aligned(16)));
-static lv co_vregion[LC_CO_VREGION];
+LC_BIGDATA static uint8_t co_cregion[LC_CO_REGION] __attribute__((aligned(16)));
+LC_BIGDATA static lv co_vregion[LC_CO_VREGION];
 static uint8_t sched_stack[LC_SCHED_STACK] __attribute__((aligned(16)));
 #define REGION_TOP (co_cregion + sizeof co_cregion)
 static void *sched_sp;
