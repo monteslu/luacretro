@@ -31,9 +31,9 @@ SDKs that use it today:
 
 | SDK | Target | Video | Audio |
 |---|---|---|---|
-| sync32lua | sync32 (RP2350, Cortex-M33) | 128x128 mode, 3x on HDMI | synthesized, 48 kHz ring |
-| gbalua (`compiler/build-p8.mjs`) | Game Boy Advance | 1:1 in mode 4 | DirectSound A |
-| mdlua (`compiler/build-p8.mjs`) | Sega Genesis | 16x16 tiles on plane A | silent (see below) |
+| sync32lua | sync32 (RP2350, Cortex-M33) | 128x128 mode, 3x on HDMI | fast synth (or exact), 48 kHz |
+| gbalua (`gbalua pico8`) | Game Boy Advance | 1:1 in mode 4 | fast synth on DirectSound A, 13379 Hz |
+| mdlua (`mdlua pico8`) | Sega Genesis | 16x16 tiles on plane A | sequencer driving the PSG |
 
 The 6502 SDKs (gtlua, neslua, c64lua) stay on the static tier: the runtime
 needs a 32-bit C compiler with 64-bit integers (cc65 has neither) and more
@@ -62,7 +62,28 @@ Compile-time knobs an SDK can set:
 - `LC_BIGDATA`: a section attribute for the big buffers (GBA EWRAM).
 - `LC_CO_REGION` / `LC_CO_VREGION`: the shared coroutine stack sizes.
 - `LC_NO_FLOAT`: use the integer emulation of `tline`'s float math.
+- `LC_P8SND_FAST`: the fast synth (below); `LC_P8SND_RATE` its output rate,
+  `LC_P8SND_HOT` / `LC_P8SND_BSS` code and table placement,
+  `LC_P8SND_ZTAB` / `LC_P8SND_ZSEG` the size of its walk tables (smaller
+  only costs speed).
 - `runtime/lc_p8snd_none.c` in place of `lc_p8snd.c` for silence.
+
+## Two synthesizers
+
+`lc_p8snd.c` is an exact fixed-point port of FAKE-08's synth, which emulates
+its doubles in software: faithful, and the most expensive thing a cart does
+on a console without a double-precision FPU.
+
+Built with `-DLC_P8SND_FAST` it becomes `lc_p8snd_fast.c`: the same
+sequencer, bit-exact (`stat()` for music and sfx positions agrees on every
+frame checked), but it jumps between note events instead of stepping every
+sample, and synthesizes from wavetables once per block. Reverb, dampen and the
+note-change crossfade are dropped. It costs about 25x less per sample (on
+sync32, just-one-boss drops from 38.8% of a frame to 13.3%).
+
+For sound chips, `lc_p8_audio_advance(samples)` runs the sequencer without
+synthesis and `lc_p8_audio_voices()` reports each channel's pitch, volume
+and waveform; mdlua drives the Genesis PSG that way.
 
 ## What is inside
 
@@ -130,8 +151,9 @@ and keeps globals in a static array unless the cart uses `_ENV` as a value.
 ## Limits by console
 
 Memory decides which carts run. The heap arena is about 176 KB on sync32,
-120 KB on the GBA (EWRAM) and 12 KB on the Genesis, so most BBS carts fit
-sync32, many fit the GBA, and only small ones fit the Genesis.
+120 KB on the GBA (EWRAM) and 10 KB on the Genesis, so most BBS carts fit
+sync32, many fit the GBA, and only small ones fit the Genesis (10 KB, since
+SGDK needs the rest of its 64 KB).
 
 CPU decides how well they run. On sync32 most carts fit the ABI's 150 MHz
 floor; heavy 3D and effect carts do not, and the console's real clock
