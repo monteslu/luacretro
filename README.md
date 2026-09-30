@@ -22,28 +22,44 @@ const { ok, c, diagnostics, callGraph, stubs } =
 
 ## Targets and capabilities
 
-The emitter derives every per-platform behavior from a single capability table
-(`CAPS` in `compiler/emit.js`) keyed by `opts.target`:
+luacretro holds no table of consoles. Each SDK passes a target descriptor
+`{ caps, harness }` as `opts.target`: `caps` switches compiler behaviors,
+`harness` names the SDK runtime symbols the generated frame loop calls (see
+each SDK's `compiler/index.js`). The caps the static tier understands:
 
-| target     | zpFastcall | banked | nativeDiv | colorBake | framebuffer | cName |
-|------------|:----------:|:------:|:---------:|:---------:|:-----------:|-------|
-| `gametank` |     ✓      |   ✓    |           |     ✓     |      ✓      | `gt_` |
-| `gba`      |            |        |     ✓     |           |      ✓      | `gba_`|
-| `md`       |            |        |     ✓     |           |      ✓      | `md_` |
-| `nes`      |     ✓      |        |           |     ✓     |             | `nes_`|
-| `c64`      |     ✓      |        |           |     ✓     |      ✓      | `c64_`|
-
-- **zpFastcall** — the 6502 zero-page fastcall ABI (draw builtins stage args in
-  `gt_a*`, user fns in `gt_p*`, fixed mul/div through `fa`/`fb`).
-- **banked** — GameTank FLASH2M cross-bank far-call machinery.
-- **nativeDiv** — hardware integer divide/modulo (else the runtime helpers).
-- **colorBake** — bake a static P8 color literal 0-15 to a raw platform palette
+- **zpFastcall** / **zpUserFn** / **fixedZp**: the 6502 zero-page fastcall ABI
+  (draw builtins stage args in zero page, leaf user functions take 1-5 int
+  params there, fixed mul/div go through zero-page entry points).
+- **banked**: GameTank FLASH2M cross-bank far-call machinery.
+- **nativeDiv**: hardware integer divide/modulo (else the runtime helpers).
+- **colorBake**: bake a static P8 color literal 0-15 to a raw platform palette
   byte at compile time (needs `opts.p8Palette`).
-- **framebuffer** — a full pixel surface (every draw verb lands); `nes` is a
-  tile/sprite machine, so its SDK enables only the verbs it can honor.
+- **framebuffer**: a full pixel surface (every draw verb lands); a tile/sprite
+  machine like the NES enables only the verbs it can honor.
+- **prefix** / **finalRename**: the C name prefix of the SDK runtime.
+- **dynamic**: route to the dynamic tier (below).
 
 Per-target static-allocation caps come from `opts.limits`
 (`{arrayMax, poolMax}`); the defaults preserve the historical gtlua numbers.
+
+## The dynamic tier: unmodified PICO-8 carts
+
+Alongside the static subset, luacretro compiles **the whole PICO-8 language**
+(tables, closures, metatables, coroutines, varargs, `_ENV`, strings) ahead
+of time to C, linked against a portable runtime in `runtime/` that includes
+the PICO-8 machine (graphics, print, synth, memory map). Real carts from the
+BBS build unchanged into native ROMs, still with no interpreter on the
+console:
+
+```js
+import { compileCart, RUNTIME_SOURCES } from "luacretro/dyn";
+const { ok, c, diagnostics } = compileCart(bytes, "game.p8.png");
+```
+
+It needs a 32-bit C target; how many carts fit depends on RAM. sync32lua,
+gbalua and mdlua build PICO-8 carts with it. The 6502 SDKs stay on the
+static tier. See [DYNAMIC.md](DYNAMIC.md) for the runtime, the platform
+contract (`runtime/lc_plat.h`), how it is verified, and known differences.
 
 The compiler is browser-safe (no node: / Buffer) so the web IDEs bundle it
 unchanged. See `SPEC.md` for the language. The Python-family sibling is
