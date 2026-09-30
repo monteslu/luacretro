@@ -151,7 +151,7 @@ and keeps globals in a static array unless the cart uses `_ENV` as a value.
 ## Limits by console
 
 Memory decides which carts run. The heap arena is about 176 KB on sync32,
-120 KB on the GBA (EWRAM) and 10 KB on the Genesis, so most BBS carts fit
+120 KB on the GBA (EWRAM) and roughly 10 KB on the Genesis (what SGDK leaves free), so most BBS carts fit
 sync32, many fit the GBA, and only small ones fit the Genesis (its heap is small because
 SGDK needs the rest of its 64 KB).
 
