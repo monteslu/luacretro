@@ -28,7 +28,8 @@
     "DYNAMIC.md",
     "THIRD_PARTY.md",
     "SPEC.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "node --test 'test/**/*.test.js'"

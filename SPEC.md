@@ -1,5 +1,8 @@
 # gtlua language specification - v0.2
 
+This is the static tier's dialect. To compile unmodified PICO-8 carts (the
+full language) see [DYNAMIC.md](DYNAMIC.md).
+
 gtlua is a statically-compiled, PICO-8-flavored Lua dialect for the GameTank
 (design rationale and roadmap: [PICO8.md](PICO8.md)). It keeps PICO-8's
 surface syntax and number model over a fixed semantic core that lowers to C
