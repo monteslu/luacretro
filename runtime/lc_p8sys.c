@@ -21,8 +21,8 @@ uint8_t lc_p8_fps = 30;
 /* ---- memory ---------------------------------------------------------------------- */
 
 void lc_p8_reset_memory(void) {
-  for (uint32_t i = 0; i < 0x4300; i++) lc_p8mem[i] = 0;
-  for (uint32_t i = 0x5f00; i < 0x8000 && i < LC_P8_MEMSIZE; i++) lc_p8mem[i] = 0;
+  lc_memset(lc_p8mem, 0, 0x4300);
+  lc_memset(lc_p8mem + 0x5f00, 0, (LC_P8_MEMSIZE < 0x8000 ? LC_P8_MEMSIZE : 0x8000) - 0x5f00);
   lc_p8mem[P8_COLORMASK] = 0xff;
   lc_p8mem[P8_SPRMAP] = 0x00;
   lc_p8mem[P8_SCRMAP] = 0x60;

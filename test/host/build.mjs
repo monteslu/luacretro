@@ -20,7 +20,7 @@ export function buildHost(cartPath, outBin, { cflags = [] } = {}) {
     s === "lc_p8snd.c" && process.env.LC_AUDIO_STUB ? process.env.LC_AUDIO_STUB : path.join(rt, s))];
   try {
     execFileSync("gcc", ["-std=gnu11", "-O2", "-g", "-no-pie", "-fno-pie", "-DLC_HOSTED_LIBC", `-I${rt}`,
-      "-Wall", "-Wno-unused-parameter", "-Wno-unused-function", ...cflags, "-o", outBin, ...srcs], { stdio: ["ignore", "pipe", "pipe"] });
+      "-Wall", "-Wno-unused-parameter", "-Wno-unused-function", ...JSON.parse(process.env.LC_HOST_CFLAGS ?? "[]"), ...cflags, "-o", outBin, ...srcs], { stdio: ["ignore", "pipe", "pipe"] });
   } catch (e) {
     return { ok: false, error: String(e.stderr || e.message) };
   }
